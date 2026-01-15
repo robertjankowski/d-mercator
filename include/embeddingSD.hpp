@@ -50,6 +50,7 @@
 #include <utility>
 #include <vector>
 #include <filesystem>
+#include <memory>
 // Eigen library
 #include "Eigen/Core"
 #include "Eigen/SparseCore"
@@ -60,6 +61,7 @@
 #include "hyp2f1.hpp"
 #include "integrate_expected_degree.hpp"
 #include "readjust_positions.hpp"
+#include "hyperbolic_loglikelihood_cuda.hpp"
 
 class embeddingSD_t
 {
@@ -178,6 +180,11 @@ class embeddingSD_t
     // Widths of the columns in output file.
     int width_names;
     int width_values;
+#ifdef MERCATOR_USE_CUDA
+    std::unique_ptr<embeddingSD_cuda::LogLikelihoodWorkspace> cuda_loglikelihood_;
+    std::vector<double> d_positions_flat;
+    std::unique_ptr<embeddingSD_cuda::LogLikelihoodWorkspace1D> cuda_loglikelihood_1d_;
+#endif
 
   // Objects related to the original graph.
   private:
@@ -381,6 +388,23 @@ class embeddingSD_t
     void embed();
     void embed(int dim); // Perform the embedding in D dimension
     void embed(std::string edgelist_filename) { EDGELIST_FILENAME = edgelist_filename; embed(); };
+  private:
+    double compute_loglikelihood_sum(int dim,
+                                     int v1,
+                                     const std::vector<double> &pos1,
+                                     const std::vector<int> &neighbors,
+                                     double radius);
+    double compute_loglikelihood_sum_1d(int v1,
+                                        double theta1,
+                                        const std::vector<int> &neighbors);
+#ifdef MERCATOR_USE_CUDA
+    void initialize_cuda_loglikelihood(int dim);
+    void update_cuda_position(int dim, int v1);
+    bool use_cuda_loglikelihood() const;
+    void initialize_cuda_loglikelihood_1d();
+    void update_cuda_theta(int v1);
+    bool use_cuda_loglikelihood_1d() const;
+#endif
 };
 
 
@@ -2996,6 +3020,139 @@ void embeddingSD_t::order_vertices()
   layer_set.clear();
 }
 
+double embeddingSD_t::compute_loglikelihood_sum(int dim,
+                                                int v1,
+                                                const std::vector<double> &pos1,
+                                                const std::vector<int> &neighbors,
+                                                double radius)
+{
+#ifdef MERCATOR_USE_CUDA
+  if (use_cuda_loglikelihood())
+  {
+    return cuda_loglikelihood_->compute_loglikelihood_sum(v1,
+                                                          pos1.data(),
+                                                          neighbors.empty() ? nullptr : neighbors.data(),
+                                                          static_cast<int>(neighbors.size()),
+                                                          mu,
+                                                          beta,
+                                                          radius);
+  }
+#endif
+  double sum = 0;
+  for (int v2 = 0; v2 < nb_vertices; ++v2)
+  {
+    sum += compute_pairwise_loglikelihood(dim, v1, pos1, v2, d_positions[v2], false, radius);
+  }
+  for (const auto v2 : neighbors)
+  {
+    sum += compute_pairwise_loglikelihood(dim, v1, pos1, v2, d_positions[v2], true, radius);
+  }
+  return sum;
+}
+
+double embeddingSD_t::compute_loglikelihood_sum_1d(int v1,
+                                                   double theta1,
+                                                   const std::vector<int> &neighbors)
+{
+#ifdef MERCATOR_USE_CUDA
+  if (use_cuda_loglikelihood_1d())
+  {
+    return cuda_loglikelihood_1d_->compute_loglikelihood_sum(v1,
+                                                             theta1,
+                                                             neighbors.empty() ? nullptr : neighbors.data(),
+                                                             static_cast<int>(neighbors.size()),
+                                                             mu,
+                                                             beta);
+  }
+#endif
+  double sum = 0;
+  for(int v2(0); v2<nb_vertices; ++v2)
+  {
+    sum += compute_pairwise_loglikelihood(v1, theta1, v2, theta[v2], false);
+  }
+  for (const auto v2 : neighbors)
+  {
+    sum += compute_pairwise_loglikelihood(v1, theta1, v2, theta[v2], true);
+  }
+  return sum;
+}
+
+#ifdef MERCATOR_USE_CUDA
+void embeddingSD_t::initialize_cuda_loglikelihood(int dim)
+{
+  if (!embeddingSD_cuda::LogLikelihoodWorkspace::cuda_available())
+  {
+    return;
+  }
+  cuda_loglikelihood_ = std::make_unique<embeddingSD_cuda::LogLikelihoodWorkspace>(dim, nb_vertices);
+  if (!cuda_loglikelihood_->is_cuda_enabled())
+  {
+    return;
+  }
+  const int dim_plus_one = dim + 1;
+  d_positions_flat.assign(static_cast<size_t>(nb_vertices) * dim_plus_one, 0.0);
+  for (int v = 0; v < nb_vertices; ++v)
+  {
+    const size_t offset = static_cast<size_t>(v) * dim_plus_one;
+    for (int i = 0; i < dim_plus_one; ++i)
+    {
+      d_positions_flat[offset + i] = d_positions[v][i];
+    }
+  }
+  cuda_loglikelihood_->set_positions(d_positions_flat.data(), d_positions_flat.size());
+  cuda_loglikelihood_->set_kappas(kappa.data(), kappa.size());
+}
+
+void embeddingSD_t::update_cuda_position(int dim, int v1)
+{
+  if (!use_cuda_loglikelihood())
+  {
+    return;
+  }
+  const int dim_plus_one = dim + 1;
+  const size_t offset = static_cast<size_t>(v1) * dim_plus_one;
+  for (int i = 0; i < dim_plus_one; ++i)
+  {
+    d_positions_flat[offset + i] = d_positions[v1][i];
+  }
+  cuda_loglikelihood_->update_position(v1, d_positions[v1].data());
+}
+
+bool embeddingSD_t::use_cuda_loglikelihood() const
+{
+  return cuda_loglikelihood_ && cuda_loglikelihood_->is_cuda_enabled();
+}
+
+void embeddingSD_t::initialize_cuda_loglikelihood_1d()
+{
+  if (!embeddingSD_cuda::LogLikelihoodWorkspace1D::cuda_available())
+  {
+    return;
+  }
+  cuda_loglikelihood_1d_ = std::make_unique<embeddingSD_cuda::LogLikelihoodWorkspace1D>(nb_vertices);
+  if (!cuda_loglikelihood_1d_->is_cuda_enabled())
+  {
+    return;
+  }
+  cuda_loglikelihood_1d_->set_thetas(theta.data(), theta.size());
+  cuda_loglikelihood_1d_->set_kappas(kappa.data(), kappa.size());
+}
+
+void embeddingSD_t::update_cuda_theta(int v1)
+{
+  if (!use_cuda_loglikelihood_1d())
+  {
+    return;
+  }
+  cuda_loglikelihood_1d_->update_theta(v1, theta[v1]);
+}
+
+bool embeddingSD_t::use_cuda_loglikelihood_1d() const
+{
+  return cuda_loglikelihood_1d_ && cuda_loglikelihood_1d_->is_cuda_enabled();
+}
+#endif
+
 
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
@@ -3006,20 +3163,11 @@ int embeddingSD_t::refine_angle(int v1)
   double tmp_angle;
   double tmp_loglikelihood;
   double best_angle = theta[v1];
+  std::vector<int> neighbors(adjacency_list[v1].begin(), adjacency_list[v1].end());
   // Iterators.
   std::set<int>::iterator it2, end;
   // Computes the current loglikelihood.
-  double previous_loglikelihood = 0;
-  for(int v2(0); v2<nb_vertices; ++v2)
-  {
-    previous_loglikelihood += compute_pairwise_loglikelihood(v1, best_angle, v2, theta[v2], false);
-  }
-  it2 = adjacency_list[v1].begin();
-  end = adjacency_list[v1].end();
-  for(; it2!=end; ++it2)
-  {
-    previous_loglikelihood += compute_pairwise_loglikelihood(v1, best_angle, *it2, theta[*it2], true);
-  }
+  double previous_loglikelihood = compute_loglikelihood_sum_1d(v1, best_angle, neighbors);
   double best_loglikelihood = previous_loglikelihood;
 
   // Computes the weighted average angular positions of the neighbors.
@@ -3069,17 +3217,7 @@ int embeddingSD_t::refine_angle(int v1)
       tmp_angle = tmp_angle + (2 * PI);
 
     // Computes the local loglikelihood.
-    tmp_loglikelihood = 0;
-    for(int v2(0); v2<nb_vertices; ++v2)
-    {
-      tmp_loglikelihood += compute_pairwise_loglikelihood(v1, tmp_angle, v2, theta[v2], false);
-    }
-    it2 = adjacency_list[v1].begin();
-    end = adjacency_list[v1].end();
-    for(; it2!=end; ++it2)
-    {
-      tmp_loglikelihood += compute_pairwise_loglikelihood(v1, tmp_angle, *it2, theta[*it2], true);
-    }
+    tmp_loglikelihood = compute_loglikelihood_sum_1d(v1, tmp_angle, neighbors);
     // Preserves the optimal angular sector.
     if(tmp_loglikelihood > best_loglikelihood)
     {
@@ -3091,6 +3229,9 @@ int embeddingSD_t::refine_angle(int v1)
 
   // Registers the best position found.
   theta[v1] = best_angle;
+#ifdef MERCATOR_USE_CUDA
+  update_cuda_theta(v1);
+#endif
   // Returns 1 if the vertex changed position, and 0 otherwise.
   return has_moved;
 }
@@ -3105,20 +3246,11 @@ int embeddingSD_t::refine_angle(int dim, int v1, double radius)
   double tmp_angle;
   double tmp_loglikelihood;
   auto best_position = d_positions[v1];
+  std::vector<int> neighbors(adjacency_list[v1].begin(), adjacency_list[v1].end());
   // Iterators.
   std::set<int>::iterator it2, end;
   // Computes the current loglikelihood.
-  double previous_loglikelihood = 0;
-  for(int v2(0); v2<nb_vertices; ++v2)
-  {
-    previous_loglikelihood += compute_pairwise_loglikelihood(dim, v1, best_position, v2, d_positions[v2], false, radius);
-  }
-  it2 = adjacency_list[v1].begin();
-  end = adjacency_list[v1].end();
-  for(; it2!=end; ++it2)
-  {
-    previous_loglikelihood += compute_pairwise_loglikelihood(dim, v1, best_position, *it2, d_positions[*it2], true, radius);
-  }
+  double previous_loglikelihood = compute_loglikelihood_sum(dim, v1, best_position, neighbors, radius);
   double best_loglikelihood = previous_loglikelihood;
 
   // Compute the weighted average positions of the neighbors
@@ -3158,17 +3290,7 @@ int embeddingSD_t::refine_angle(int dim, int v1, double radius)
     normalize_and_rescale_vector(proposed_position, radius);
 
     // Computes the local loglikelihood.
-    tmp_loglikelihood = 0;
-    for(int v2(0); v2<nb_vertices; ++v2)
-    {
-      tmp_loglikelihood += compute_pairwise_loglikelihood(dim, v1, proposed_position, v2, d_positions[v2], false, radius);
-    }
-    it2 = adjacency_list[v1].begin();
-    end = adjacency_list[v1].end();
-    for(; it2!=end; ++it2)
-    {
-      tmp_loglikelihood += compute_pairwise_loglikelihood(dim, v1, proposed_position, *it2, d_positions[*it2], true, radius);
-    }
+    tmp_loglikelihood = compute_loglikelihood_sum(dim, v1, proposed_position, neighbors, radius);
     // Preserves the optimal angular sector.
     if(tmp_loglikelihood > best_loglikelihood)
     {
@@ -3179,6 +3301,9 @@ int embeddingSD_t::refine_angle(int dim, int v1, double radius)
   }
   // Registers the best position found.
   d_positions[v1] = best_position;
+#ifdef MERCATOR_USE_CUDA
+  update_cuda_position(dim, v1);
+#endif
   // Returns 1 if the vertex changed position, and 0 otherwise.
   return has_moved;
 }
@@ -3196,6 +3321,9 @@ void embeddingSD_t::refine_positions(int dim)
   if(delta_nb_vertices < 1) { delta_nb_vertices = 1; }
   int width = 2 * (std::log10(nb_vertices) + 1) + 6;
   const auto radius = compute_radius(dim, nb_vertices);
+#ifdef MERCATOR_USE_CUDA
+  initialize_cuda_loglikelihood(dim);
+#endif
   for(int v_i(0), v_f(0), v_m, n_v; v_f<nb_vertices;)
   {
     v_f = (v_i + delta_nb_vertices);
@@ -3240,6 +3368,9 @@ void embeddingSD_t::refine_positions()
   int delta_nb_vertices = nb_vertices / 19.999999;
   if(delta_nb_vertices < 1) { delta_nb_vertices = 1; }
   int width = 2 * (std::log10(nb_vertices) + 1) + 6;
+#ifdef MERCATOR_USE_CUDA
+  initialize_cuda_loglikelihood_1d();
+#endif
   for(int v_i(0), v_f(0), v_m, n_v; v_f<nb_vertices;)
   {
     v_f = (v_i + delta_nb_vertices);
