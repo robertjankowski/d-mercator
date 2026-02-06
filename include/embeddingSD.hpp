@@ -34,6 +34,7 @@
 #include <algorithm>
 // #include <execution>
 // #include <chrono>
+#include <cstdlib>
 #include <cmath>
 #include <ctime>
 #include <complex>
@@ -43,6 +44,7 @@
 #include <iomanip>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <random>
 #include <set>
 #include <sstream>
@@ -60,6 +62,9 @@
 #include "hyp2f1.hpp"
 #include "integrate_expected_degree.hpp"
 #include "readjust_positions.hpp"
+#ifdef DMERCATOR_USE_CUDA
+#include "dmercator_cuda.hpp"
+#endif
 
 class embeddingSD_t
 {
@@ -224,6 +229,17 @@ class embeddingSD_t
     std::vector<double> theta;
     // Positions of the vertices in S^D
     std::vector<std::vector<double>> d_positions;
+#ifdef DMERCATOR_USE_CUDA
+    // CUDA backend state (optional, enabled only when compiled with DMERCATOR_USE_CUDA).
+    bool cuda_requested = true;
+    bool cuda_available = false;
+    bool cuda_s1_refinement_active = false;
+    bool cuda_sd_refinement_active = false;
+    std::vector<int> adjacency_row_offsets;
+    std::vector<int> adjacency_col_indices;
+    std::vector<double> d_positions_soa_cache;
+    std::unique_ptr<dmercator::cuda::LikelihoodBackend> cuda_backend;
+#endif
     // sinus and cosinus of theta.
     // std::vector<double> sin_theta;
     // std::vector<double> cos_theta;
@@ -371,6 +387,27 @@ class embeddingSD_t
     double euclidean_distance(const std::vector<double> &v1, const std::vector<double> &v2);
     // Save hidden degrees and exit
     void save_kappas_and_exit();
+#ifdef DMERCATOR_USE_CUDA
+    // Build CSR from adjacency_list for GPU kernels.
+    void build_adjacency_csr();
+    // Initialize optional CUDA backend, with graceful fallback to CPU.
+    void initialize_cuda_backend();
+    // Prepare/refill device buffers prior to refinement passes.
+    bool prepare_cuda_refinement_s1();
+    bool prepare_cuda_refinement_sd(int dim);
+    // Score candidate positions on GPU. Returns false on runtime failure.
+    bool evaluate_candidates_s1_cuda(int v1,
+                                     const std::vector<double> &candidate_angles,
+                                     std::vector<double> &scores);
+    bool evaluate_candidates_sd_cuda(int dim,
+                                     int v1,
+                                     double radius,
+                                     const std::vector<std::vector<double>> &candidate_positions,
+                                     std::vector<double> &scores);
+    // Keep mutable positions synchronized with device buffers.
+    void sync_theta_entry_cuda(int v1);
+    void sync_position_entry_cuda(int v1);
+#endif
   // Public functions to perform the embeddings.
   public:
     // Constructor (empty).
@@ -2689,6 +2726,10 @@ void embeddingSD_t::initialize()
   if(!QUIET_MODE) { std::clog << "..................................................................done."                     << std::endl; }
   if(!QUIET_MODE) { std::clog                                                                                                  << std::endl; }
 
+#ifdef DMERCATOR_USE_CUDA
+  initialize_cuda_backend();
+#endif
+
   // Sets the decimal precision of the log.
   std::clog.precision(4);
 
@@ -2996,6 +3037,228 @@ void embeddingSD_t::order_vertices()
   layer_set.clear();
 }
 
+#ifdef DMERCATOR_USE_CUDA
+void embeddingSD_t::build_adjacency_csr()
+{
+  adjacency_row_offsets.clear();
+  adjacency_col_indices.clear();
+
+  adjacency_row_offsets.resize(nb_vertices + 1, 0);
+  for(int v = 0; v < nb_vertices; ++v)
+  {
+    adjacency_row_offsets[v + 1] = adjacency_row_offsets[v] + adjacency_list[v].size();
+  }
+  adjacency_col_indices.resize(adjacency_row_offsets.back());
+  for(int v = 0; v < nb_vertices; ++v)
+  {
+    int offset = adjacency_row_offsets[v];
+    for(const auto &neighbor : adjacency_list[v])
+    {
+      adjacency_col_indices[offset++] = neighbor;
+    }
+  }
+}
+
+void embeddingSD_t::initialize_cuda_backend()
+{
+  cuda_requested = true;
+  cuda_available = false;
+  cuda_s1_refinement_active = false;
+  cuda_sd_refinement_active = false;
+
+  const char *disable_cuda = std::getenv("DMERCATOR_DISABLE_CUDA");
+  if(disable_cuda && std::string(disable_cuda) == "1")
+  {
+    cuda_requested = false;
+    if(!QUIET_MODE)
+    {
+      std::clog << TAB << "CUDA backend: disabled by DMERCATOR_DISABLE_CUDA=1" << std::endl;
+    }
+    return;
+  }
+
+  build_adjacency_csr();
+  cuda_backend = std::make_unique<dmercator::cuda::LikelihoodBackend>();
+  std::string error_message;
+  if(!cuda_backend->initialize(nb_vertices, adjacency_row_offsets, adjacency_col_indices, &error_message))
+  {
+    if(!QUIET_MODE)
+    {
+      std::clog << TAB << "WARNING: CUDA backend unavailable, falling back to CPU: " << error_message << std::endl;
+    }
+    cuda_backend.reset();
+    return;
+  }
+
+  cuda_available = true;
+  if(!QUIET_MODE)
+  {
+    std::clog << TAB << "CUDA backend: enabled for refinement scoring." << std::endl;
+  }
+}
+
+bool embeddingSD_t::prepare_cuda_refinement_s1()
+{
+  if(!cuda_available || !cuda_backend)
+  {
+    return false;
+  }
+
+  std::string error_message;
+  if(!cuda_backend->update_kappa(kappa, &error_message))
+  {
+    if(!QUIET_MODE)
+    {
+      std::clog << TAB << "WARNING: CUDA fallback to CPU (kappa upload failed): " << error_message << std::endl;
+    }
+    return false;
+  }
+  if(!cuda_backend->update_theta(theta, &error_message))
+  {
+    if(!QUIET_MODE)
+    {
+      std::clog << TAB << "WARNING: CUDA fallback to CPU (theta upload failed): " << error_message << std::endl;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool embeddingSD_t::prepare_cuda_refinement_sd(int dim)
+{
+  if(!cuda_available || !cuda_backend)
+  {
+    return false;
+  }
+
+  std::string error_message;
+  if(!cuda_backend->update_kappa(kappa, &error_message))
+  {
+    if(!QUIET_MODE)
+    {
+      std::clog << TAB << "WARNING: CUDA fallback to CPU (kappa upload failed): " << error_message << std::endl;
+    }
+    return false;
+  }
+
+  d_positions_soa_cache.clear();
+  d_positions_soa_cache.resize(static_cast<size_t>(dim + 1) * nb_vertices, 0);
+  for(int v = 0; v < nb_vertices; ++v)
+  {
+    for(int i = 0; i < dim + 1; ++i)
+    {
+      d_positions_soa_cache[static_cast<size_t>(i) * nb_vertices + v] = d_positions[v][i];
+    }
+  }
+  if(!cuda_backend->update_positions_soa(dim + 1, d_positions_soa_cache, &error_message))
+  {
+    if(!QUIET_MODE)
+    {
+      std::clog << TAB << "WARNING: CUDA fallback to CPU (positions upload failed): " << error_message << std::endl;
+    }
+    return false;
+  }
+  return true;
+}
+
+bool embeddingSD_t::evaluate_candidates_s1_cuda(int v1,
+                                                const std::vector<double> &candidate_angles,
+                                                std::vector<double> &scores)
+{
+  if(!cuda_s1_refinement_active || !cuda_backend)
+  {
+    return false;
+  }
+
+  std::string error_message;
+  const double prefactor = nb_vertices / (2 * PI * mu);
+  if(!cuda_backend->score_candidates_s1(v1, prefactor, beta, candidate_angles, scores, &error_message))
+  {
+    if(!QUIET_MODE)
+    {
+      std::clog << TAB << "WARNING: CUDA scoring failed, switching to CPU: " << error_message << std::endl;
+    }
+    cuda_s1_refinement_active = false;
+    return false;
+  }
+  return true;
+}
+
+bool embeddingSD_t::evaluate_candidates_sd_cuda(int dim,
+                                                int v1,
+                                                double radius,
+                                                const std::vector<std::vector<double>> &candidate_positions,
+                                                std::vector<double> &scores)
+{
+  if(!cuda_sd_refinement_active || !cuda_backend)
+  {
+    return false;
+  }
+
+  if(candidate_positions.empty())
+  {
+    scores.clear();
+    return true;
+  }
+
+  const int nb_candidates = candidate_positions.size();
+  std::vector<double> candidates_soa(static_cast<size_t>(dim + 1) * nb_candidates, 0);
+  for(int c = 0; c < nb_candidates; ++c)
+  {
+    for(int i = 0; i < dim + 1; ++i)
+    {
+      candidates_soa[static_cast<size_t>(i) * nb_candidates + c] = candidate_positions[c][i];
+    }
+  }
+
+  std::string error_message;
+  if(!cuda_backend->score_candidates_sd(dim, v1, radius, mu, beta, candidates_soa, scores, &error_message))
+  {
+    if(!QUIET_MODE)
+    {
+      std::clog << TAB << "WARNING: CUDA scoring failed, switching to CPU: " << error_message << std::endl;
+    }
+    cuda_sd_refinement_active = false;
+    return false;
+  }
+  return true;
+}
+
+void embeddingSD_t::sync_theta_entry_cuda(int v1)
+{
+  if(!cuda_s1_refinement_active || !cuda_backend)
+  {
+    return;
+  }
+  std::string error_message;
+  if(!cuda_backend->update_theta_entry(v1, theta[v1], &error_message))
+  {
+    if(!QUIET_MODE)
+    {
+      std::clog << TAB << "WARNING: CUDA theta sync failed, switching to CPU: " << error_message << std::endl;
+    }
+    cuda_s1_refinement_active = false;
+  }
+}
+
+void embeddingSD_t::sync_position_entry_cuda(int v1)
+{
+  if(!cuda_sd_refinement_active || !cuda_backend)
+  {
+    return;
+  }
+  std::string error_message;
+  if(!cuda_backend->update_position_entry(v1, d_positions[v1], &error_message))
+  {
+    if(!QUIET_MODE)
+    {
+      std::clog << TAB << "WARNING: CUDA position sync failed, switching to CPU: " << error_message << std::endl;
+    }
+    cuda_sd_refinement_active = false;
+  }
+}
+#endif
+
 
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
@@ -3003,28 +3266,11 @@ int embeddingSD_t::refine_angle(int v1)
 {
   // Variables.
   int has_moved = 0;
-  double tmp_angle;
-  double tmp_loglikelihood;
   double best_angle = theta[v1];
-  // Iterators.
-  std::set<int>::iterator it2, end;
-  // Computes the current loglikelihood.
-  double previous_loglikelihood = 0;
-  for(int v2(0); v2<nb_vertices; ++v2)
-  {
-    previous_loglikelihood += compute_pairwise_loglikelihood(v1, best_angle, v2, theta[v2], false);
-  }
-  it2 = adjacency_list[v1].begin();
-  end = adjacency_list[v1].end();
-  for(; it2!=end; ++it2)
-  {
-    previous_loglikelihood += compute_pairwise_loglikelihood(v1, best_angle, *it2, theta[*it2], true);
-  }
-  double best_loglikelihood = previous_loglikelihood;
 
   // Computes the weighted average angular positions of the neighbors.
-  it2 = adjacency_list[v1].begin();
-  end = adjacency_list[v1].end();
+  auto it2 = adjacency_list[v1].begin();
+  auto end = adjacency_list[v1].end();
   double t2, k2, da;
   double sum_sin_theta = 0;
   double sum_cos_theta = 0;
@@ -3057,40 +3303,67 @@ int embeddingSD_t::refine_angle(int v1)
   }
   max_angle /= 2;
 
-  // Considers various wisely chosen new angular positions and keeps the best.
+  // Builds candidate list (first entry is the current position).
   int _nb_new_angles_to_try = MIN_NB_ANGLES_TO_TRY * std::max(1.0, std::log(nb_vertices));
+  std::vector<double> candidate_angles;
+  candidate_angles.reserve(_nb_new_angles_to_try + 1);
+  candidate_angles.push_back(best_angle);
   for(int e(0); e<_nb_new_angles_to_try; ++e)
   {
     // Gets the angle in the standard range.
-    tmp_angle = (normal_01(engine) * max_angle) + average_theta;
+    double tmp_angle = (normal_01(engine) * max_angle) + average_theta;
     while(tmp_angle > (2 * PI))
       tmp_angle = tmp_angle - (2 * PI);
     while(tmp_angle < 0)
       tmp_angle = tmp_angle + (2 * PI);
+    candidate_angles.push_back(tmp_angle);
+  }
 
-    // Computes the local loglikelihood.
-    tmp_loglikelihood = 0;
-    for(int v2(0); v2<nb_vertices; ++v2)
+  std::vector<double> candidate_scores;
+#ifdef DMERCATOR_USE_CUDA
+  bool scored_on_gpu = evaluate_candidates_s1_cuda(v1, candidate_angles, candidate_scores);
+#else
+  bool scored_on_gpu = false;
+#endif
+
+  if(!scored_on_gpu)
+  {
+    candidate_scores.resize(candidate_angles.size(), 0);
+    for(int c = 0; c < candidate_angles.size(); ++c)
     {
-      tmp_loglikelihood += compute_pairwise_loglikelihood(v1, tmp_angle, v2, theta[v2], false);
+      const double angle = candidate_angles[c];
+      double ll = 0;
+      for(int v2(0); v2<nb_vertices; ++v2)
+      {
+        ll += compute_pairwise_loglikelihood(v1, angle, v2, theta[v2], false);
+      }
+      for(auto it = adjacency_list[v1].begin(), it_end = adjacency_list[v1].end(); it != it_end; ++it)
+      {
+        ll += compute_pairwise_loglikelihood(v1, angle, *it, theta[*it], true);
+      }
+      candidate_scores[c] = ll;
     }
-    it2 = adjacency_list[v1].begin();
-    end = adjacency_list[v1].end();
-    for(; it2!=end; ++it2)
+  }
+
+  double best_loglikelihood = candidate_scores[0];
+  for(int c = 1; c < candidate_scores.size(); ++c)
+  {
+    if(candidate_scores[c] > best_loglikelihood)
     {
-      tmp_loglikelihood += compute_pairwise_loglikelihood(v1, tmp_angle, *it2, theta[*it2], true);
-    }
-    // Preserves the optimal angular sector.
-    if(tmp_loglikelihood > best_loglikelihood)
-    {
-      best_loglikelihood = tmp_loglikelihood;
-      best_angle = tmp_angle;
+      best_loglikelihood = candidate_scores[c];
+      best_angle = candidate_angles[c];
       has_moved = 1;
     }
   }
 
   // Registers the best position found.
   theta[v1] = best_angle;
+#ifdef DMERCATOR_USE_CUDA
+  if(has_moved)
+  {
+    sync_theta_entry_cuda(v1);
+  }
+#endif
   // Returns 1 if the vertex changed position, and 0 otherwise.
   return has_moved;
 }
@@ -3102,29 +3375,12 @@ int embeddingSD_t::refine_angle(int dim, int v1, double radius)
 {
   // Variables.
   int has_moved = 0;
-  double tmp_angle;
-  double tmp_loglikelihood;
   auto best_position = d_positions[v1];
-  // Iterators.
-  std::set<int>::iterator it2, end;
-  // Computes the current loglikelihood.
-  double previous_loglikelihood = 0;
-  for(int v2(0); v2<nb_vertices; ++v2)
-  {
-    previous_loglikelihood += compute_pairwise_loglikelihood(dim, v1, best_position, v2, d_positions[v2], false, radius);
-  }
-  it2 = adjacency_list[v1].begin();
-  end = adjacency_list[v1].end();
-  for(; it2!=end; ++it2)
-  {
-    previous_loglikelihood += compute_pairwise_loglikelihood(dim, v1, best_position, *it2, d_positions[*it2], true, radius);
-  }
-  double best_loglikelihood = previous_loglikelihood;
 
   // Compute the weighted average positions of the neighbors
   std::vector<double> mean_vector(dim + 1, 0);
-  it2 = adjacency_list[v1].begin();
-  end = adjacency_list[v1].end();
+  auto it2 = adjacency_list[v1].begin();
+  auto end = adjacency_list[v1].end();
   for(; it2!=end; ++it2)
   {
     // Identifies the neighbor.
@@ -3147,8 +3403,11 @@ int embeddingSD_t::refine_angle(int dim, int v1, double radius)
   }
   max_angle /= 2;
 
-  // Considers various wisely chosen new angular positions and keeps the best.
+  // Builds candidate list (first entry is the current position).
   int _nb_new_angles_to_try = MIN_NB_ANGLES_TO_TRY * std::max(1.0, std::log(nb_vertices));
+  std::vector<std::vector<double>> candidate_positions;
+  candidate_positions.reserve(_nb_new_angles_to_try + 1);
+  candidate_positions.push_back(best_position);
   for(int e(0); e<_nb_new_angles_to_try; ++e)
   {
     // Get the position in the standard range.
@@ -3156,29 +3415,53 @@ int embeddingSD_t::refine_angle(int dim, int v1, double radius)
     for (int i=0; i<dim+1; ++i)
       proposed_position[i] = max_angle * normal_01(engine) + mean_vector[i] / radius; // multivariate normal distribution
     normalize_and_rescale_vector(proposed_position, radius);
+    candidate_positions.push_back(proposed_position);
+  }
 
-    // Computes the local loglikelihood.
-    tmp_loglikelihood = 0;
-    for(int v2(0); v2<nb_vertices; ++v2)
+  std::vector<double> candidate_scores;
+#ifdef DMERCATOR_USE_CUDA
+  bool scored_on_gpu = evaluate_candidates_sd_cuda(dim, v1, radius, candidate_positions, candidate_scores);
+#else
+  bool scored_on_gpu = false;
+#endif
+
+  if(!scored_on_gpu)
+  {
+    candidate_scores.resize(candidate_positions.size(), 0);
+    for(int c = 0; c < candidate_positions.size(); ++c)
     {
-      tmp_loglikelihood += compute_pairwise_loglikelihood(dim, v1, proposed_position, v2, d_positions[v2], false, radius);
+      const auto &candidate = candidate_positions[c];
+      double ll = 0;
+      for(int v2(0); v2<nb_vertices; ++v2)
+      {
+        ll += compute_pairwise_loglikelihood(dim, v1, candidate, v2, d_positions[v2], false, radius);
+      }
+      for(auto it = adjacency_list[v1].begin(), it_end = adjacency_list[v1].end(); it != it_end; ++it)
+      {
+        ll += compute_pairwise_loglikelihood(dim, v1, candidate, *it, d_positions[*it], true, radius);
+      }
+      candidate_scores[c] = ll;
     }
-    it2 = adjacency_list[v1].begin();
-    end = adjacency_list[v1].end();
-    for(; it2!=end; ++it2)
+  }
+
+  double best_loglikelihood = candidate_scores[0];
+  for(int c = 1; c < candidate_scores.size(); ++c)
+  {
+    if(candidate_scores[c] > best_loglikelihood)
     {
-      tmp_loglikelihood += compute_pairwise_loglikelihood(dim, v1, proposed_position, *it2, d_positions[*it2], true, radius);
-    }
-    // Preserves the optimal angular sector.
-    if(tmp_loglikelihood > best_loglikelihood)
-    {
-      best_loglikelihood = tmp_loglikelihood;
-      best_position = proposed_position;
+      best_loglikelihood = candidate_scores[c];
+      best_position = candidate_positions[c];
       has_moved = 1;
     }
   }
   // Registers the best position found.
   d_positions[v1] = best_position;
+#ifdef DMERCATOR_USE_CUDA
+  if(has_moved)
+  {
+    sync_position_entry_cuda(v1);
+  }
+#endif
   // Returns 1 if the vertex changed position, and 0 otherwise.
   return has_moved;
 }
@@ -3190,12 +3473,42 @@ void embeddingSD_t::refine_positions(int dim)
   if(!QUIET_MODE) { std::clog << "Refining the positions..."; }
   if(!QUIET_MODE) { std::clog << std::endl; }
 
+#ifdef DMERCATOR_USE_CUDA
+  cuda_sd_refinement_active = prepare_cuda_refinement_sd(dim);
+#endif
+
+  const bool trace_loglikelihood = (std::getenv("DMERCATOR_TRACE_LOGLIKELIHOOD") != nullptr &&
+                                    std::string(std::getenv("DMERCATOR_TRACE_LOGLIKELIHOOD")) == "1");
+  std::vector<double> loglikelihood_trace;
+
   double start_time, stop_time;
   std::string vertices_range;
   int delta_nb_vertices = nb_vertices / 19.999999;
   if(delta_nb_vertices < 1) { delta_nb_vertices = 1; }
   int width = 2 * (std::log10(nb_vertices) + 1) + 6;
   const auto radius = compute_radius(dim, nb_vertices);
+
+  if(trace_loglikelihood)
+  {
+    auto compute_total_loglikelihood = [&]() -> double
+    {
+      double total_ll = 0;
+      for(int v1 = 0; v1 < nb_vertices; ++v1)
+      {
+        for(int v2 = v1 + 1; v2 < nb_vertices; ++v2)
+        {
+          total_ll += compute_pairwise_loglikelihood(dim, v1, d_positions[v1], v2, d_positions[v2], false, radius);
+          if(adjacency_list[v1].find(v2) != adjacency_list[v1].end())
+          {
+            total_ll += compute_pairwise_loglikelihood(dim, v1, d_positions[v1], v2, d_positions[v2], true, radius);
+          }
+        }
+      }
+      return total_ll;
+    };
+    loglikelihood_trace.push_back(compute_total_loglikelihood());
+  }
+
   for(int v_i(0), v_f(0), v_m, n_v; v_f<nb_vertices;)
   {
     v_f = (v_i + delta_nb_vertices);
@@ -3210,10 +3523,42 @@ void embeddingSD_t::refine_positions(int dim)
     }
     stop_time = time_since_epoch_in_seconds();
     if(!QUIET_MODE) { std::clog << "...done in " << std::setw(6) << std::fixed << stop_time - start_time << " seconds (" << std::setw(std::log10(delta_nb_vertices) + 1) << v_m << "/" << std::setw(std::log10(delta_nb_vertices) + 1) << n_v << " changed position)" << std::endl; }
+
+    if(trace_loglikelihood)
+    {
+      double total_ll = 0;
+      for(int v1 = 0; v1 < nb_vertices; ++v1)
+      {
+        for(int v2 = v1 + 1; v2 < nb_vertices; ++v2)
+        {
+          total_ll += compute_pairwise_loglikelihood(dim, v1, d_positions[v1], v2, d_positions[v2], false, radius);
+          if(adjacency_list[v1].find(v2) != adjacency_list[v1].end())
+          {
+            total_ll += compute_pairwise_loglikelihood(dim, v1, d_positions[v1], v2, d_positions[v2], true, radius);
+          }
+        }
+      }
+      loglikelihood_trace.push_back(total_ll);
+    }
   }
 
   if(!QUIET_MODE) { std::clog << "                         .............................................................done." << std::endl; }
   if(!QUIET_MODE) { std::clog << std::endl; }
+
+  if(trace_loglikelihood)
+  {
+    std::fstream trace_file((ROOTNAME_OUTPUT + ".inf_ll_trace").c_str(), std::fstream::out);
+    trace_file << "# chunk_id loglikelihood\n";
+    for(int i = 0; i < loglikelihood_trace.size(); ++i)
+    {
+      trace_file << i << " " << loglikelihood_trace[i] << "\n";
+    }
+    trace_file.close();
+  }
+
+#ifdef DMERCATOR_USE_CUDA
+  cuda_sd_refinement_active = false;
+#endif
 }
 
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
@@ -3222,6 +3567,31 @@ void embeddingSD_t::refine_positions()
 {
   if(!QUIET_MODE) { std::clog << "Refining the positions..."; }
   if(!QUIET_MODE) { std::clog << std::endl; }
+
+#ifdef DMERCATOR_USE_CUDA
+  cuda_s1_refinement_active = prepare_cuda_refinement_s1();
+#endif
+
+  const bool trace_loglikelihood = (std::getenv("DMERCATOR_TRACE_LOGLIKELIHOOD") != nullptr &&
+                                    std::string(std::getenv("DMERCATOR_TRACE_LOGLIKELIHOOD")) == "1");
+  std::vector<double> loglikelihood_trace;
+
+  if(trace_loglikelihood)
+  {
+    double total_ll = 0;
+    for(int v1 = 0; v1 < nb_vertices; ++v1)
+    {
+      for(int v2 = v1 + 1; v2 < nb_vertices; ++v2)
+      {
+        total_ll += compute_pairwise_loglikelihood(v1, theta[v1], v2, theta[v2], false);
+        if(adjacency_list[v1].find(v2) != adjacency_list[v1].end())
+        {
+          total_ll += compute_pairwise_loglikelihood(v1, theta[v1], v2, theta[v2], true);
+        }
+      }
+    }
+    loglikelihood_trace.push_back(total_ll);
+  }
 
   // // Imposes a global random shift on the angular positions.
   // double theta_shift = 2 * PI * uniform_01(engine);
@@ -3254,6 +3624,23 @@ void embeddingSD_t::refine_positions()
     }
     stop_time = time_since_epoch_in_seconds();
     if(!QUIET_MODE) { std::clog << "...done in " << std::setw(6) << std::fixed << stop_time - start_time << " seconds (" << std::setw(std::log10(delta_nb_vertices) + 1) << v_m << "/" << std::setw(std::log10(delta_nb_vertices) + 1) << n_v << " changed position)" << std::endl; }
+
+    if(trace_loglikelihood)
+    {
+      double total_ll = 0;
+      for(int v1 = 0; v1 < nb_vertices; ++v1)
+      {
+        for(int v2 = v1 + 1; v2 < nb_vertices; ++v2)
+        {
+          total_ll += compute_pairwise_loglikelihood(v1, theta[v1], v2, theta[v2], false);
+          if(adjacency_list[v1].find(v2) != adjacency_list[v1].end())
+          {
+            total_ll += compute_pairwise_loglikelihood(v1, theta[v1], v2, theta[v2], true);
+          }
+        }
+      }
+      loglikelihood_trace.push_back(total_ll);
+    }
   }
   // for(int j(0); j<5; ++j)
   // {
@@ -3280,6 +3667,21 @@ void embeddingSD_t::refine_positions()
 
   if(!QUIET_MODE) { std::clog << "                         .............................................................done." << std::endl; }
   if(!QUIET_MODE) { std::clog << std::endl; }
+
+  if(trace_loglikelihood)
+  {
+    std::fstream trace_file((ROOTNAME_OUTPUT + ".inf_ll_trace").c_str(), std::fstream::out);
+    trace_file << "# chunk_id loglikelihood\n";
+    for(int i = 0; i < loglikelihood_trace.size(); ++i)
+    {
+      trace_file << i << " " << loglikelihood_trace[i] << "\n";
+    }
+    trace_file.close();
+  }
+
+#ifdef DMERCATOR_USE_CUDA
+  cuda_s1_refinement_active = false;
+#endif
 }
 
 void embeddingSD_t::save_inferred_connection_probability(int dim)

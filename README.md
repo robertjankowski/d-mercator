@@ -36,6 +36,33 @@ chmod +x build.sh
 ./build.sh -b Release
 ```
 
+#### CUDA backend (optional)
+
+The CUDA path accelerates the refinement likelihood scoring loops (edge and non-edge terms) and keeps the rest of the pipeline unchanged.
+
+Requirements
+* NVIDIA CUDA toolkit (with `nvcc`)
+* A CUDA-capable GPU
+
+Build commands:
+
+```bash
+# CPU-only build (default)
+cmake -S . -B build-cpu -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DDMERCATOR_ENABLE_CUDA=OFF
+cmake --build build-cpu -j 8
+
+# CUDA-enabled build
+cmake -S . -B build-cuda -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DDMERCATOR_ENABLE_CUDA=ON
+cmake --build build-cuda -j 8
+```
+
+Runtime selection:
+* CUDA-enabled binary uses GPU scoring by default.
+* Set `DMERCATOR_DISABLE_CUDA=1` to force CPU scoring at runtime (useful for A/B validation).
+
+Optional reproducibility diagnostics:
+* Set `DMERCATOR_TRACE_LOGLIKELIHOOD=1` to save chunk-wise likelihood progression to `*.inf_ll_trace`.
+
 ### Python module
 
 Download all submodules with
@@ -104,6 +131,23 @@ Running `mercator` is quite straightforward
 # Python module
 mercator.embed(<edgelist_filename>)
 ```
+
+Performance expectations:
+* Largest speedups are during the refinement stage (`refine_angle`) where many candidate positions are scored against all vertices.
+* Eigen/Spectra eigensolver stages remain CPU-side.
+
+CPU vs GPU consistency test:
+
+```bash
+python3 test/cuda_cpu_consistency.py \
+  --cpu-bin /path/to/mercator_cpu \
+  --gpu-bin /path/to/mercator_cuda
+```
+
+The test compares:
+* inferred `beta`/`mu`,
+* inferred node scalars (`kappa`, radial coordinate) and positional consistency,
+* likelihood progression from `*.inf_ll_trace`.
 
 
 ### Output files

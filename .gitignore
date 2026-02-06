@@ -33,3 +33,4 @@ cmake-build-release
 !test/*
 !lib/*
 lib/__pycache__
+test/__pycache__
