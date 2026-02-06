@@ -36,6 +36,7 @@
 // #include <chrono>
 #include <cstdlib>
 #include <cmath>
+#include <cstdint>
 #include <ctime>
 #include <complex>
 #include <exception>
@@ -65,6 +66,34 @@
 #ifdef DMERCATOR_USE_CUDA
 #include "dmercator_cuda.hpp"
 #endif
+
+inline std::uint64_t dmercator_splitmix64(std::uint64_t x)
+{
+  x += 0x9e3779b97f4a7c15ULL;
+  x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+  x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+  return x ^ (x >> 31);
+}
+
+inline double dmercator_uniform01_u64(std::uint64_t seed, std::uint64_t index, std::uint64_t stream)
+{
+  std::uint64_t value = seed ^ (index * 0x9e3779b97f4a7c15ULL);
+  value ^= (stream + 1ULL) * 0xbf58476d1ce4e5b9ULL;
+  value = dmercator_splitmix64(value);
+  return static_cast<double>(value >> 11) * (1.0 / 9007199254740992.0);
+}
+
+inline double dmercator_normal01_u64(std::uint64_t seed, std::uint64_t index, std::uint64_t stream)
+{
+  constexpr double TWO_PI = 6.283185307179586476925286766559005768394;
+  double u1 = dmercator_uniform01_u64(seed, index, stream);
+  double u2 = dmercator_uniform01_u64(seed, index, stream + 1ULL);
+  if(u1 < 1e-12)
+  {
+    u1 = 1e-12;
+  }
+  return std::sqrt(-2.0 * std::log(u1)) * std::cos(TWO_PI * u2);
+}
 
 class embeddingSD_t
 {
@@ -172,6 +201,14 @@ class embeddingSD_t
     std::set<int> degree_class;
     // Cumulative probability used for the calculation of clustering using MC integration.
     std::map<int, std::map<double, int, std::less<>>> cumul_prob_kgkp;
+    // Degree-class caches (contiguous layout) used by infer_parameters hot paths.
+    std::vector<int> degree_class_values_cache;
+    std::vector<int> degree_class_sizes_cache;
+    std::vector<int> degree_value_to_class_index_cache;
+    std::vector<double> degree_class_pair_prob_cache;
+    std::vector<double> degree_class_cdf_cache;
+    std::vector<double> degree_class_cdf_total_cache;
+    bool degree_class_pair_prob_cache_valid = false;
     // List containing the order in which the vertices will be considered in the maximization phase.
     std::vector<int> ordered_list_of_vertices;
     // Time stamps.
@@ -368,6 +405,8 @@ class embeddingSD_t
     // See Eq. (A3) in Mercator paper
     double draw_random_angular_distance(int d1, int d2, double R, double p12);
     double draw_random_angular_distance(int d1, int d2, double R, double p12, int dim);
+    // Rebuild contiguous degree-class caches from degree_class and degree2vertices.
+    void refresh_degree_class_caches();
     // Compute the radius in S^D model with a given network size.
     inline double compute_radius(int dim, int N) const;
     // Calculate mu in D-dimension
@@ -436,6 +475,15 @@ void embeddingSD_t::analyze_degrees()
   // Resizes the list of degrees.
   degree.clear();
   degree.resize(nb_vertices);
+  degree_class.clear();
+  degree2vertices.clear();
+  degree_class_pair_prob_cache_valid = false;
+  degree_class_values_cache.clear();
+  degree_class_sizes_cache.clear();
+  degree_value_to_class_index_cache.clear();
+  degree_class_pair_prob_cache.clear();
+  degree_class_cdf_cache.clear();
+  degree_class_cdf_total_cache.clear();
   if(VALIDATION_MODE)
   {
     sum_degree_of_neighbors.clear();
@@ -585,60 +633,113 @@ void embeddingSD_t::analyze_simulated_adjacency_list()
   }
 }
 
+void embeddingSD_t::refresh_degree_class_caches()
+{
+  std::vector<int> new_class_values(degree_class.begin(), degree_class.end());
+  if(new_class_values != degree_class_values_cache)
+  {
+    degree_class_pair_prob_cache_valid = false;
+  }
+  degree_class_values_cache.swap(new_class_values);
+
+  const int nb_classes = static_cast<int>(degree_class_values_cache.size());
+  degree_class_sizes_cache.assign(nb_classes, 0);
+
+  int max_degree_value = 0;
+  for(int i = 0; i < nb_classes; ++i)
+  {
+    const int degree_value = degree_class_values_cache[i];
+    auto degree_it = degree2vertices.find(degree_value);
+    if(degree_it != degree2vertices.end())
+    {
+      degree_class_sizes_cache[i] = static_cast<int>(degree_it->second.size());
+    }
+    if(degree_value > max_degree_value)
+    {
+      max_degree_value = degree_value;
+    }
+  }
+
+  degree_value_to_class_index_cache.assign(max_degree_value + 1, -1);
+  for(int i = 0; i < nb_classes; ++i)
+  {
+    degree_value_to_class_index_cache[degree_class_values_cache[i]] = i;
+  }
+
+  degree_class_cdf_cache.assign(static_cast<size_t>(nb_classes) * nb_classes, 0.0);
+  degree_class_cdf_total_cache.assign(nb_classes, 0.0);
+}
+
 void embeddingSD_t::build_cumul_dist_for_mc_integration(int dim) {
-  int v1;
+  refresh_degree_class_caches();
+  const int nb_classes = static_cast<int>(degree_class_values_cache.size());
+  if(nb_classes == 0)
+  {
+    cumul_prob_kgkp.clear();
+    return;
+  }
+
   double tmp_val, tmp_cumul;
   const double R = compute_radius(dim, nb_vertices);
   mu = calculate_mu(dim);
-  // Temporary container.
-  std::map<int, double> nkkp;
   // Resets the main object.
   cumul_prob_kgkp.clear();
-  // Iterator objects.
-  std::set<int>::iterator it1, end1, it2, end2;
-  // For all degree classes over 1.
-  it1 = degree_class.begin();
-  end1 = degree_class.end();
-  while(*it1 < 2) { ++it1; }
-  for(; it1!=end1; ++it1)
+  for(int i = 0; i < nb_classes; ++i)
   {
-    // Reinitializes the temporary container.
-    nkkp.clear();
-
-    // For all degree classes.
-    it2 = degree_class.begin();
-    end2 = degree_class.end();
-    for(; it2!=end2; ++it2) {
-      // Initializes the temporary container.
-      nkkp[*it2] = 0;
+    const int degree_i = degree_class_values_cache[i];
+    if(degree_i < 2)
+    {
+      continue;
     }
 
-    // For all degree classes.
-    it2 = degree_class.begin();
-    end2 = degree_class.end();
-    for(; it2!=end2; ++it2) {
-      const auto kappa1 = random_ensemble_kappa_per_degree_class[*it1];
-      const auto kappa2 = random_ensemble_kappa_per_degree_class[*it2];
-      tmp_val = compute_integral_expected_degree_dimensions(dim, R, mu, beta, kappa1, kappa2);
-      nkkp[*it2] = degree2vertices[*it2].size() * tmp_val / random_ensemble_expected_degree_per_degree_class[*it1];
+    const double expected_degree = random_ensemble_expected_degree_per_degree_class[degree_i];
+    if(expected_degree <= NUMERICAL_ZERO)
+    {
+      cumul_prob_kgkp[degree_i][1.0] = degree_class_values_cache[0];
+      for(int j = 0; j < nb_classes; ++j)
+      {
+        degree_class_cdf_cache[static_cast<size_t>(i) * nb_classes + j] = 1.0;
+      }
+      degree_class_cdf_total_cache[i] = 1.0;
+      continue;
     }
 
-    // Initializes the cumulating variable.
     tmp_cumul = 0;
-    // Initializes the sub-container.
-    cumul_prob_kgkp[*it1];
-    // For all degree classes.
-    it2 = degree_class.begin();
-    end2 = degree_class.end();
-    for(; it2!=end2; ++it2) {
-      tmp_val = nkkp[*it2];
+    for(int j = 0; j < nb_classes; ++j)
+    {
+      const int degree_j = degree_class_values_cache[j];
+      if(degree_class_pair_prob_cache_valid &&
+         degree_class_pair_prob_cache.size() == static_cast<size_t>(nb_classes) * nb_classes)
+      {
+        tmp_val = degree_class_pair_prob_cache[static_cast<size_t>(i) * nb_classes + j];
+      }
+      else
+      {
+        const auto kappa_i = random_ensemble_kappa_per_degree_class[degree_i];
+        const auto kappa_j = random_ensemble_kappa_per_degree_class[degree_j];
+        tmp_val = compute_integral_expected_degree_dimensions(dim, R, mu, beta, kappa_i, kappa_j);
+      }
+
+      tmp_val = (degree_class_sizes_cache[j] * tmp_val) / expected_degree;
       if(tmp_val > NUMERICAL_ZERO)
       {
-        // Cumulates the probabilities;
         tmp_cumul += tmp_val;
-        // Builds the cumulative distribution.
-        cumul_prob_kgkp[*it1][tmp_cumul] = *it2;
+        cumul_prob_kgkp[degree_i][tmp_cumul] = degree_j;
       }
+      degree_class_cdf_cache[static_cast<size_t>(i) * nb_classes + j] = tmp_cumul;
+    }
+    if(tmp_cumul <= NUMERICAL_ZERO)
+    {
+      cumul_prob_kgkp[degree_i][1.0] = degree_class_values_cache[0];
+      for(int j = 0; j < nb_classes; ++j)
+      {
+        degree_class_cdf_cache[static_cast<size_t>(i) * nb_classes + j] = 1.0;
+      }
+      degree_class_cdf_total_cache[i] = 1.0;
+    }
+    else
+    {
+      degree_class_cdf_total_cache[i] = tmp_cumul;
     }
   }
 }
@@ -647,63 +748,76 @@ void embeddingSD_t::build_cumul_dist_for_mc_integration(int dim) {
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
 void embeddingSD_t::build_cumul_dist_for_mc_integration()
 {
-  // Variables.
-  int v1;
+  refresh_degree_class_caches();
+  const int nb_classes = static_cast<int>(degree_class_values_cache.size());
+  if(nb_classes == 0)
+  {
+    cumul_prob_kgkp.clear();
+    return;
+  }
+
   double tmp_val, tmp_cumul;
   // Parameters.
   double R = nb_vertices / (2 * PI);
   mu = calculateMu();
-  // Temporary container.
-  std::map<int, double> nkkp;
   // Resets the main object.
   cumul_prob_kgkp.clear();
-  // Iterator objects.
-  std::set<int>::iterator it1, end1, it2, end2;
-  // For all degree classes over 1.
-  it1 = degree_class.begin();
-  end1 = degree_class.end();
-  while(*it1 < 2) { ++it1; }
-  for(; it1!=end1; ++it1)
+  for(int i = 0; i < nb_classes; ++i)
   {
-    // Reinitializes the temporary container.
-    nkkp.clear();
-
-    // For all degree classes.
-    it2 = degree_class.begin();
-    end2 = degree_class.end();
-    for(; it2!=end2; ++it2)
+    const int degree_i = degree_class_values_cache[i];
+    if(degree_i < 2)
     {
-      // Initializes the temporary container.
-      nkkp[*it2] = 0;
+      continue;
+    }
+    const double expected_degree = random_ensemble_expected_degree_per_degree_class[degree_i];
+    if(expected_degree <= NUMERICAL_ZERO)
+    {
+      cumul_prob_kgkp[degree_i][1.0] = degree_class_values_cache[0];
+      for(int j = 0; j < nb_classes; ++j)
+      {
+        degree_class_cdf_cache[static_cast<size_t>(i) * nb_classes + j] = 1.0;
+      }
+      degree_class_cdf_total_cache[i] = 1.0;
+      continue;
     }
 
-    // For all degree classes.
-    it2 = degree_class.begin();
-    end2 = degree_class.end();
-    for(; it2!=end2; ++it2)
-    {
-      tmp_val = hyp2f1a(beta, -std::pow((PI * R) / (mu * random_ensemble_kappa_per_degree_class[*it1] * random_ensemble_kappa_per_degree_class[*it2]), beta));
-      nkkp[*it2] = degree2vertices[*it2].size() * tmp_val / random_ensemble_expected_degree_per_degree_class[*it1];
-    }
-
-    // Initializes the cumulating variable.
     tmp_cumul = 0;
-    // Initializes the sub-container.
-    cumul_prob_kgkp[*it1];
-    // For all degree classes.
-    it2 = degree_class.begin();
-    end2 = degree_class.end();
-    for(; it2!=end2; ++it2)
+    for(int j = 0; j < nb_classes; ++j)
     {
-
-      tmp_val = nkkp[*it2];
+      const int degree_j = degree_class_values_cache[j];
+      if(degree_class_pair_prob_cache_valid &&
+         degree_class_pair_prob_cache.size() == static_cast<size_t>(nb_classes) * nb_classes)
+      {
+        tmp_val = degree_class_pair_prob_cache[static_cast<size_t>(i) * nb_classes + j];
+      }
+      else
+      {
+        tmp_val = hyp2f1a(beta,
+                          -std::pow(nb_vertices / (2.0 * mu *
+                                                   random_ensemble_kappa_per_degree_class[degree_i] *
+                                                   random_ensemble_kappa_per_degree_class[degree_j]),
+                                    beta));
+      }
+      tmp_val = (degree_class_sizes_cache[j] * tmp_val) / expected_degree;
       if(tmp_val > NUMERICAL_ZERO)
       {
-        // Cumulates the probabilities;
         tmp_cumul += tmp_val;
-        // Builds the cumulative distribution.
-        cumul_prob_kgkp[*it1][tmp_cumul] = *it2;
+        cumul_prob_kgkp[degree_i][tmp_cumul] = degree_j;
       }
+      degree_class_cdf_cache[static_cast<size_t>(i) * nb_classes + j] = tmp_cumul;
+    }
+    if(tmp_cumul <= NUMERICAL_ZERO)
+    {
+      cumul_prob_kgkp[degree_i][1.0] = degree_class_values_cache[0];
+      for(int j = 0; j < nb_classes; ++j)
+      {
+        degree_class_cdf_cache[static_cast<size_t>(i) * nb_classes + j] = 1.0;
+      }
+      degree_class_cdf_total_cache[i] = 1.0;
+    }
+    else
+    {
+      degree_class_cdf_total_cache[i] = tmp_cumul;
     }
   }
 }
@@ -716,14 +830,6 @@ void embeddingSD_t::compute_clustering()
   average_clustering = 0;
   // Variables.
   double nb_triangles, tmp_val;
-  // Vector objects.
-  std::vector<int> intersection;
-  // Set objects.
-  std::set<int> neighbors_v2;
-  // Iterator objects.
-  std::vector<int>::iterator it;
-  std::set<int>::iterator it1, end1, it2, end2;
-  std::map<int, std::vector<int> >::iterator it3, end3;
   if(VALIDATION_MODE)
   {
     // Initializes the individual clustering coefficients.
@@ -739,34 +845,39 @@ void embeddingSD_t::compute_clustering()
     d1 = degree[v1];
     if( d1 > 1 )
     {
+      const auto &neighbors_v1 = adjacency_list[v1];
       // Loops over the neighbors of vertex v1.
-      it1 = adjacency_list[v1].begin();
-      end1 = adjacency_list[v1].end();
-      for(; it1!=end1; ++it1)
+      for(auto it1 = neighbors_v1.begin(); it1 != neighbors_v1.end(); ++it1)
       {
+        const int v2 = *it1;
         // Performs the calculation only if degree > 1.
-        if( degree[*it1] > 1 )
+        if(degree[v2] > 1)
         {
-          // Builds an ordered list of the neighbourhood of v2
-          it2 = adjacency_list[*it1].begin();
-          end2 = adjacency_list[*it1].end();
-          neighbors_v2.clear();
-          for(; it2!=end2; ++it2)
+          const auto &neighbors_v2 = adjacency_list[v2];
+          if(neighbors_v2.empty())
           {
-            if(*it1 < *it2) // Ensures that triangles will be counted only once.
-            {
-              neighbors_v2.insert(*it2);
-            }
+            continue;
           }
-          // Counts the number of triangles.
-          if(neighbors_v2.size() > 0)
+
+          // Count common neighbors in sorted sets while enforcing v2 < v3 to count each triangle once.
+          auto a = neighbors_v1.begin();
+          auto b = neighbors_v2.upper_bound(v2);
+          while(a != neighbors_v1.end() && b != neighbors_v2.end())
           {
-            intersection.clear();
-            intersection.resize(std::min(adjacency_list[v1].size(), neighbors_v2.size()));
-            it = std::set_intersection(adjacency_list[v1].begin(), adjacency_list[v1].end(),
-                                  neighbors_v2.begin(), neighbors_v2.end(), intersection.begin());
-            intersection.resize(it-intersection.begin());
-            nb_triangles += intersection.size();
+            if(*a < *b)
+            {
+              ++a;
+            }
+            else if(*b < *a)
+            {
+              ++b;
+            }
+            else
+            {
+              nb_triangles += 1;
+              ++a;
+              ++b;
+            }
           }
         }
       }
@@ -929,28 +1040,144 @@ double embeddingSD_t::draw_random_angular_distance(int d1, int d2, double R, dou
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
 double embeddingSD_t::compute_random_ensemble_clustering_for_degree_class(int d1, int dim)
 {
-  // Variables.
-  double z12, z13, da;
-  // Parameters.
+  refresh_degree_class_caches();
+  const int nb_classes = static_cast<int>(degree_class_values_cache.size());
+  if(nb_classes == 0 || degree_value_to_class_index_cache.empty() ||
+     d1 < 0 || d1 >= static_cast<int>(degree_value_to_class_index_cache.size()))
+  {
+    return 0;
+  }
+  const int d1_idx = degree_value_to_class_index_cache[d1];
+  if(d1_idx < 0)
+  {
+    return 0;
+  }
+
   double p23 = 0;
   const int nb_points = EXP_CLUST_NB_INTEGRATION_MC_STEPS;
   const double R = compute_radius(dim, nb_vertices);
   mu = calculate_mu(dim);
+  const double row_total =
+    (d1_idx < static_cast<int>(degree_class_cdf_total_cache.size()))
+      ? degree_class_cdf_total_cache[d1_idx]
+      : 0.0;
+  const std::uint64_t seed_base =
+    static_cast<std::uint64_t>(SEED) ^
+    (static_cast<std::uint64_t>(d1 + 1) * 0x9e3779b97f4a7c15ULL) ^
+    (static_cast<std::uint64_t>(dim + 1) * 0xbf58476d1ce4e5b9ULL);
+
   // MC integration.
 #pragma omp parallel for default(shared) reduction(+:p23)
   for(int i=0; i<nb_points; ++i)
   {
-    // Gets the degree of vertex 2 and 3; and Computes their probability of being connected (A.3.2.i).
-    const auto [d2, p12] = degree_of_random_vertex_and_prob_conn(d1, R, dim);
-    const auto [d3, p13] = degree_of_random_vertex_and_prob_conn(d1, R, dim);
+    const auto sample_degree_and_probability = [&](std::uint64_t stream)
+    {
+      int sampled_idx = 0;
+      if(row_total > NUMERICAL_ZERO &&
+         degree_class_cdf_cache.size() == static_cast<size_t>(nb_classes) * nb_classes)
+      {
+        const double target = dmercator_uniform01_u64(seed_base, static_cast<std::uint64_t>(i), stream) * row_total;
+        const double *row_begin = degree_class_cdf_cache.data() + static_cast<size_t>(d1_idx) * nb_classes;
+        const double *row_end = row_begin + nb_classes;
+        const double *it = std::lower_bound(row_begin, row_end, target);
+        sampled_idx = static_cast<int>(it - row_begin);
+        if(sampled_idx >= nb_classes)
+        {
+          sampled_idx = nb_classes - 1;
+        }
+      }
+      else
+      {
+        sampled_idx = static_cast<int>(dmercator_uniform01_u64(seed_base, static_cast<std::uint64_t>(i), stream) * nb_classes);
+        if(sampled_idx >= nb_classes)
+        {
+          sampled_idx = nb_classes - 1;
+        }
+      }
+
+      const int sampled_degree = degree_class_values_cache[sampled_idx];
+      double sampled_probability = 0;
+      if(degree_class_pair_prob_cache_valid &&
+         degree_class_pair_prob_cache.size() == static_cast<size_t>(nb_classes) * nb_classes)
+      {
+        sampled_probability = degree_class_pair_prob_cache[static_cast<size_t>(d1_idx) * nb_classes + sampled_idx];
+      }
+      else
+      {
+        const auto kappa1 = random_ensemble_kappa_per_degree_class[d1];
+        const auto kappa2 = random_ensemble_kappa_per_degree_class[sampled_degree];
+        sampled_probability = compute_integral_expected_degree_dimensions(dim, R, mu, beta, kappa1, kappa2);
+      }
+      return std::make_pair(sampled_degree, sampled_probability);
+    };
+
+    const auto [d2, p12] = sample_degree_and_probability(0ULL);
+    const auto [d3, p13] = sample_degree_and_probability(1ULL);
+    if(p12 <= NUMERICAL_ZERO || p13 <= NUMERICAL_ZERO)
+    {
+      continue;
+    }
+
+    const auto draw_angle = [&](int degree_a, int degree_b, double p_conn, std::uint64_t stream)
+    {
+      const double pc = dmercator_uniform01_u64(seed_base, static_cast<std::uint64_t>(i), stream);
+      double zmin = 0;
+      double zmax = PI;
+      double z = 0;
+      while((zmax - zmin) > NUMERICAL_CONVERGENCE_THRESHOLD_2)
+      {
+        z = (zmax + zmin) / 2;
+        const double pz = compute_integral_expected_degree_dimensions(dim,
+                                                                      R,
+                                                                      mu,
+                                                                      beta,
+                                                                      random_ensemble_kappa_per_degree_class[degree_a],
+                                                                      random_ensemble_kappa_per_degree_class[degree_b],
+                                                                      z) / p_conn;
+        if(pz > pc)
+        {
+          zmax = z;
+        }
+        else
+        {
+          zmin = z;
+        }
+      }
+      return (zmax + zmin) / 2;
+    };
 
     // Random angular distances between vertex (1, 2) and (1, 3) (A.3.2.ii).
-    z12 = draw_random_angular_distance(d1, d2, R, p12, dim);
-    z13 = draw_random_angular_distance(d1, d3, R, p13, dim);
+    const double z12 = draw_angle(d1, d2, p12, 2ULL);
+    const double z13 = draw_angle(d1, d3, p13, 3ULL);
+
+    const auto generate_vector_with_first_coordinate = [&](double angle, std::uint64_t stream_base)
+    {
+      std::vector<double> positions(dim + 1, 0.0);
+      double norm = 0;
+      for(int coord = 1; coord < dim + 1; ++coord)
+      {
+        const double value = dmercator_normal01_u64(seed_base ^ (static_cast<std::uint64_t>(coord) * 0x94d049bb133111ebULL),
+                                                    static_cast<std::uint64_t>(i),
+                                                    stream_base + static_cast<std::uint64_t>(coord) * 2ULL);
+        positions[coord] = value;
+        norm += value * value;
+      }
+      if(norm < NUMERICAL_ZERO)
+      {
+        positions[1] = 1.0;
+        norm = 1.0;
+      }
+      const auto first_norm = norm / std::sqrt(norm);
+      const auto tan_angle = std::tan(angle);
+      const auto denom = (std::fabs(tan_angle) < NUMERICAL_ZERO) ? NUMERICAL_ZERO : tan_angle;
+      positions[0] = (1.0 / denom) * first_norm;
+      normalize_and_rescale_vector(positions, R);
+      return positions;
+    };
 
     // Draw two random D+1 vector with first coordinate constrained by angle and compute distance between them
-    const auto v1 = generate_random_d_vector_with_first_coordinate(dim, z12, R);
-    const auto v2 = generate_random_d_vector_with_first_coordinate(dim, z13, R);
+    const auto v1 = generate_vector_with_first_coordinate(z12, 4ULL);
+    const auto v2 = generate_vector_with_first_coordinate(z13, 16ULL);
     const auto d_angle = compute_angle_d_vectors(v1, v2);
     if (d_angle < NUMERICAL_ZERO) {
       p23 += 1;
@@ -970,30 +1197,128 @@ double embeddingSD_t::compute_random_ensemble_clustering_for_degree_class(int d1
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
 double embeddingSD_t::compute_random_ensemble_clustering_for_degree_class(int d1)
 {
-  // Variables.
-  double z12, z13, da;
+  refresh_degree_class_caches();
+  const int nb_classes = static_cast<int>(degree_class_values_cache.size());
+  if(nb_classes == 0 || degree_value_to_class_index_cache.empty() ||
+     d1 < 0 || d1 >= static_cast<int>(degree_value_to_class_index_cache.size()))
+  {
+    return 0;
+  }
+  const int d1_idx = degree_value_to_class_index_cache[d1];
+  if(d1_idx < 0)
+  {
+    return 0;
+  }
+
   double p23 = 0;
-  // Parameters.
   int nb_points = EXP_CLUST_NB_INTEGRATION_MC_STEPS;
   const double R = nb_vertices / (2 * PI);
   mu = calculateMu();
+  const double row_total =
+    (d1_idx < static_cast<int>(degree_class_cdf_total_cache.size()))
+      ? degree_class_cdf_total_cache[d1_idx]
+      : 0.0;
+  const std::uint64_t seed_base =
+    static_cast<std::uint64_t>(SEED) ^
+    (static_cast<std::uint64_t>(d1 + 1) * 0x9e3779b97f4a7c15ULL);
+
   // MC integration.
 #pragma omp parallel for default(shared) reduction(+:p23)
   for(int i=0; i<nb_points; ++i)
   {
-    // Gets the degree of vertex 2 and 3; and Computes their probability of being connected (A.3.2.i).
-    const auto [d2, p12] = degree_of_random_vertex_and_prob_conn(d1, R);
-    const auto [d3, p13] = degree_of_random_vertex_and_prob_conn(d1, R);
+    const auto sample_degree_and_probability = [&](std::uint64_t stream)
+    {
+      int sampled_idx = 0;
+      if(row_total > NUMERICAL_ZERO &&
+         degree_class_cdf_cache.size() == static_cast<size_t>(nb_classes) * nb_classes)
+      {
+        const double target = dmercator_uniform01_u64(seed_base, static_cast<std::uint64_t>(i), stream) * row_total;
+        const double *row_begin = degree_class_cdf_cache.data() + static_cast<size_t>(d1_idx) * nb_classes;
+        const double *row_end = row_begin + nb_classes;
+        const double *it = std::lower_bound(row_begin, row_end, target);
+        sampled_idx = static_cast<int>(it - row_begin);
+        if(sampled_idx >= nb_classes)
+        {
+          sampled_idx = nb_classes - 1;
+        }
+      }
+      else
+      {
+        sampled_idx = static_cast<int>(dmercator_uniform01_u64(seed_base, static_cast<std::uint64_t>(i), stream) * nb_classes);
+        if(sampled_idx >= nb_classes)
+        {
+          sampled_idx = nb_classes - 1;
+        }
+      }
+
+      const int sampled_degree = degree_class_values_cache[sampled_idx];
+      double sampled_probability = 0;
+      if(degree_class_pair_prob_cache_valid &&
+         degree_class_pair_prob_cache.size() == static_cast<size_t>(nb_classes) * nb_classes)
+      {
+        sampled_probability = degree_class_pair_prob_cache[static_cast<size_t>(d1_idx) * nb_classes + sampled_idx];
+      }
+      else
+      {
+        sampled_probability = hyp2f1a(beta,
+                                      -std::pow((PI * R) /
+                                                (mu *
+                                                 random_ensemble_kappa_per_degree_class[d1] *
+                                                 random_ensemble_kappa_per_degree_class[sampled_degree]),
+                                                beta));
+      }
+      return std::make_pair(sampled_degree, sampled_probability);
+    };
+
+    const auto [d2, p12] = sample_degree_and_probability(0ULL);
+    const auto [d3, p13] = sample_degree_and_probability(1ULL);
+    if(p12 <= NUMERICAL_ZERO || p13 <= NUMERICAL_ZERO)
+    {
+      continue;
+    }
+
+    const auto draw_angle = [&](int degree_a, int degree_b, double p_conn, std::uint64_t stream)
+    {
+      const double pc = dmercator_uniform01_u64(seed_base, static_cast<std::uint64_t>(i), stream);
+      double zmin = 0;
+      double zmax = PI;
+      double z = 0;
+      while((zmax - zmin) > NUMERICAL_CONVERGENCE_THRESHOLD_2)
+      {
+        z = (zmax + zmin) / 2;
+        const double pz = (z / PI) *
+                          hyp2f1a(beta,
+                                  -std::pow((z * R) /
+                                            (mu *
+                                             random_ensemble_kappa_per_degree_class[degree_a] *
+                                             random_ensemble_kappa_per_degree_class[degree_b]),
+                                            beta)) / p_conn;
+        if(pz > pc)
+        {
+          zmax = z;
+        }
+        else
+        {
+          zmin = z;
+        }
+      }
+      return (zmax + zmin) / 2;
+    };
 
     // Random angular distances between vertex (1, 2) and (1, 3) (A.3.2.ii).
-    z12 = draw_random_angular_distance(d1, d2, R, p12);
-    z13 = draw_random_angular_distance(d1, d3, R, p13);
+    const double z12 = draw_angle(d1, d2, p12, 2ULL);
+    const double z13 = draw_angle(d1, d3, p13, 3ULL);
 
     // Set the angular distances (A.3.2.iii)
-    if(uniform_01(engine) < 0.5)
+    double da = 0;
+    if(dmercator_uniform01_u64(seed_base, static_cast<std::uint64_t>(i), 4ULL) < 0.5)
+    {
       da = std::fabs(z12 + z13);
+    }
     else
+    {
       da = std::fabs(z12 - z13);
+    }
 
     da = std::min(da, (2.0 * PI) - da);
     if(da < NUMERICAL_ZERO)
@@ -2709,159 +3034,177 @@ void embeddingSD_t::infer_kappas_given_beta_for_all_vertices()
 
 void embeddingSD_t::infer_kappas_given_beta_for_degree_class(int dim)
 {
-  // Variable.
-  double prob_conn;
-  const auto radius = compute_radius(dim, nb_vertices);
-  mu = calculate_mu(dim);
-  // Iterators.
-  std::set<int>::iterator it1, it2, end;
-  // Initializes the kappas for each degree class.
-  it1 = degree_class.begin();
-  end = degree_class.end();
-  // 1. Initialize
-  for(; it1!=end; ++it1)
+  refresh_degree_class_caches();
+  const int nb_classes = static_cast<int>(degree_class_values_cache.size());
+  if(nb_classes == 0)
   {
-    random_ensemble_kappa_per_degree_class[*it1] = *it1;
+    degree_class_pair_prob_cache_valid = false;
+    return;
   }
 
-  // 2. Finds the values of kappa generating the degree classes, given the parameters.
+  const auto radius = compute_radius(dim, nb_vertices);
+  mu = calculate_mu(dim);
+
+  std::vector<double> class_kappa(nb_classes, 0.0);
+  std::vector<double> class_expected_degree(nb_classes, 0.0);
+  std::vector<double> pair_prob_cache(static_cast<size_t>(nb_classes) * nb_classes, 0.0);
+  for(int i = 0; i < nb_classes; ++i)
+  {
+    class_kappa[i] = degree_class_values_cache[i];
+  }
+
   int cnt = 0;
   bool keep_going = true;
-  while (keep_going && (cnt < KAPPA_MAX_NB_ITER_CONV_2))
+  while(keep_going && (cnt < KAPPA_MAX_NB_ITER_CONV_2))
   {
-    // Initializes the expected degree of each degree class.
-    it1 = degree_class.begin();
-    end = degree_class.end();
-    for(; it1!=end; ++it1)
+    std::fill(class_expected_degree.begin(), class_expected_degree.end(), 0.0);
+    for(int i = 0; i < nb_classes; ++i)
     {
-      random_ensemble_expected_degree_per_degree_class[*it1] = 0;
-    }
-    // Computes the expected degrees given the actual kappas.
-    //it1 = degree_class.begin();
-    end = degree_class.end();
-    for(it1=degree_class.begin(); it1!=end; ++it1)
-    // std::for_each(std::execution::seq, degree_class.begin(), degree_class.end(), [&](const auto &it1)
-    {
-      it2 = it1;
-      auto kappa_i = random_ensemble_kappa_per_degree_class[*it1];
-      auto kappa_j = random_ensemble_kappa_per_degree_class[*it2];
-      auto integral = compute_integral_expected_degree_dimensions(dim, radius, mu, beta, kappa_i, kappa_j);
-      prob_conn = integral;
-     
-      random_ensemble_expected_degree_per_degree_class[*it1] += prob_conn * (degree2vertices[*it2].size() - 1);
-      for(++it2; it2!=end; ++it2)
+      const auto kappa_i = class_kappa[i];
+      double prob_conn = compute_integral_expected_degree_dimensions(dim,
+                                                                     radius,
+                                                                     mu,
+                                                                     beta,
+                                                                     kappa_i,
+                                                                     kappa_i);
+      pair_prob_cache[static_cast<size_t>(i) * nb_classes + i] = prob_conn;
+      class_expected_degree[i] += prob_conn * (degree_class_sizes_cache[i] - 1);
+
+      for(int j = i + 1; j < nb_classes; ++j)
       {
-        kappa_i = random_ensemble_kappa_per_degree_class[*it1];
-        kappa_j = random_ensemble_kappa_per_degree_class[*it2];
-        integral = compute_integral_expected_degree_dimensions(dim, radius, mu, beta, kappa_i, kappa_j);
-        prob_conn = integral;
-        random_ensemble_expected_degree_per_degree_class[*it1] += prob_conn * degree2vertices[*it2].size();
-        random_ensemble_expected_degree_per_degree_class[*it2] += prob_conn * degree2vertices[*it1].size();
+        prob_conn = compute_integral_expected_degree_dimensions(dim,
+                                                                radius,
+                                                                mu,
+                                                                beta,
+                                                                kappa_i,
+                                                                class_kappa[j]);
+        pair_prob_cache[static_cast<size_t>(i) * nb_classes + j] = prob_conn;
+        pair_prob_cache[static_cast<size_t>(j) * nb_classes + i] = prob_conn;
+        class_expected_degree[i] += prob_conn * degree_class_sizes_cache[j];
+        class_expected_degree[j] += prob_conn * degree_class_sizes_cache[i];
       }
     }
-    // Verifies convergence.
+
     keep_going = false;
-    it1 = degree_class.begin();
-    end = degree_class.end();
-    for(; it1!=end; ++it1)
+    for(int i = 0; i < nb_classes; ++i)
     {
-      if(std::fabs(random_ensemble_expected_degree_per_degree_class[*it1] - *it1) > NUMERICAL_CONVERGENCE_THRESHOLD_1) {
+      if(std::fabs(class_expected_degree[i] - degree_class_values_cache[i]) > NUMERICAL_CONVERGENCE_THRESHOLD_1)
+      {
         keep_going = true;
         break;
       }
     }
-    // Modifies the value of the kappas prior to the next iteration, if required.
+
     if(keep_going)
     {
-      it1 = degree_class.begin();
-      end = degree_class.end();
-      for(; it1!=end; ++it1) {
-        random_ensemble_kappa_per_degree_class[*it1] += (*it1 - random_ensemble_expected_degree_per_degree_class[*it1]) * uniform_01(engine);
-        random_ensemble_kappa_per_degree_class[*it1] = std::fabs(random_ensemble_kappa_per_degree_class[*it1]);
+      for(int i = 0; i < nb_classes; ++i)
+      {
+        class_kappa[i] += (degree_class_values_cache[i] - class_expected_degree[i]) * uniform_01(engine);
+        class_kappa[i] = std::fabs(class_kappa[i]);
       }
     }
     ++cnt;
+  }
+
+  for(int i = 0; i < nb_classes; ++i)
+  {
+    const int degree_value = degree_class_values_cache[i];
+    random_ensemble_kappa_per_degree_class[degree_value] = class_kappa[i];
+    random_ensemble_expected_degree_per_degree_class[degree_value] = class_expected_degree[i];
+  }
+  degree_class_pair_prob_cache.swap(pair_prob_cache);
+  degree_class_pair_prob_cache_valid = true;
+
+  if(cnt >= KAPPA_MAX_NB_ITER_CONV_2)
+  {
+    if(!QUIET_MODE)
+    {
+      std::clog << std::endl;
+      std::clog << TAB << "WARNING: maximum number of iterations reached before convergence. This limit can be" << std::endl;
+      std::clog << TAB << "         adjusted by setting the parameters KAPPA_MAX_NB_ITER_CONV_2 to desired value." << std::endl;
+      std::clog << TAB << std::fixed << std::setw(11) << " " << " ";
     }
-    if (cnt >= KAPPA_MAX_NB_ITER_CONV_2) {
-      if (!QUIET_MODE) {
-        std::clog << std::endl;
-        std::clog << TAB << "WARNING: maximum number of iterations reached before convergence. This limit can be"  << std::endl;
-        std::clog << TAB << "         adjusted by setting the parameters KAPPA_MAX_NB_ITER_CONV_2 to desired value." << std::endl;
-        std::clog << TAB << std::fixed << std::setw(11) << " " << " ";
-      }
-    }
+  }
 }
 
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
 void embeddingSD_t::infer_kappas_given_beta_for_degree_class()
 {
-  // Variable.
-  double prob_conn;
-  // Parameters.
-  mu = calculateMu();
-  // Iterators.
-  std::set<int>::iterator it1, it2, end;
-  // Initializes the kappas for each degree class.
-  it1 = degree_class.begin();
-  end = degree_class.end();
-  for(; it1!=end; ++it1)
+  refresh_degree_class_caches();
+  const int nb_classes = static_cast<int>(degree_class_values_cache.size());
+  if(nb_classes == 0)
   {
-    random_ensemble_kappa_per_degree_class[*it1] = *it1;
+    degree_class_pair_prob_cache_valid = false;
+    return;
   }
 
-  // Finds the values of kappa generating the degree classes, given the parameters.
+  mu = calculateMu();
+
+  std::vector<double> class_kappa(nb_classes, 0.0);
+  std::vector<double> class_expected_degree(nb_classes, 0.0);
+  std::vector<double> pair_prob_cache(static_cast<size_t>(nb_classes) * nb_classes, 0.0);
+  for(int i = 0; i < nb_classes; ++i)
+  {
+    class_kappa[i] = degree_class_values_cache[i];
+  }
+
   int cnt = 0;
   bool keep_going = true;
-  while( keep_going && (cnt < KAPPA_MAX_NB_ITER_CONV) )
+  while(keep_going && (cnt < KAPPA_MAX_NB_ITER_CONV))
   {
-    // Initializes the expected degree of each degree class.
-    it1 = degree_class.begin();
-    end = degree_class.end();
-    for(; it1!=end; ++it1)
+    std::fill(class_expected_degree.begin(), class_expected_degree.end(), 0.0);
+    for(int i = 0; i < nb_classes; ++i)
     {
-      random_ensemble_expected_degree_per_degree_class[*it1] = 0;
-    }
-    // Computes the expected degrees given the actual kappas.
-    it1 = degree_class.begin();
-    end = degree_class.end();
-    for(; it1!=end; ++it1)
-    {
-      it2 = it1;
-      prob_conn = hyp2f1a(beta, -std::pow(nb_vertices / (2.0 * mu * random_ensemble_kappa_per_degree_class[*it1] * random_ensemble_kappa_per_degree_class[*it2]), beta));
-      random_ensemble_expected_degree_per_degree_class[*it1] += prob_conn * (degree2vertices[*it2].size() - 1);
-      for(++it2; it2!=end; ++it2)
+      const auto kappa_i = class_kappa[i];
+      double prob_conn = hyp2f1a(beta,
+                                 -std::pow(nb_vertices / (2.0 * mu * kappa_i * kappa_i),
+                                           beta));
+      pair_prob_cache[static_cast<size_t>(i) * nb_classes + i] = prob_conn;
+      class_expected_degree[i] += prob_conn * (degree_class_sizes_cache[i] - 1);
+
+      for(int j = i + 1; j < nb_classes; ++j)
       {
-        prob_conn = hyp2f1a(beta, -std::pow(nb_vertices / (2.0 * mu * random_ensemble_kappa_per_degree_class[*it1] * random_ensemble_kappa_per_degree_class[*it2]), beta));
-        random_ensemble_expected_degree_per_degree_class[*it1] += prob_conn * degree2vertices[*it2].size();
-        random_ensemble_expected_degree_per_degree_class[*it2] += prob_conn * degree2vertices[*it1].size();
+        prob_conn = hyp2f1a(beta,
+                            -std::pow(nb_vertices / (2.0 * mu * kappa_i * class_kappa[j]),
+                                      beta));
+        pair_prob_cache[static_cast<size_t>(i) * nb_classes + j] = prob_conn;
+        pair_prob_cache[static_cast<size_t>(j) * nb_classes + i] = prob_conn;
+        class_expected_degree[i] += prob_conn * degree_class_sizes_cache[j];
+        class_expected_degree[j] += prob_conn * degree_class_sizes_cache[i];
       }
     }
-    // Verifies convergence.
+
     keep_going = false;
-    it1 = degree_class.begin();
-    end = degree_class.end();
-    for(; it1!=end; ++it1)
+    for(int i = 0; i < nb_classes; ++i)
     {
-      if(std::fabs(random_ensemble_expected_degree_per_degree_class[*it1] - *it1) > NUMERICAL_CONVERGENCE_THRESHOLD_1)
+      if(std::fabs(class_expected_degree[i] - degree_class_values_cache[i]) > NUMERICAL_CONVERGENCE_THRESHOLD_1)
       {
         keep_going = true;
         break;
       }
     }
-    // Modifies the value of the kappas prior to the next iteration, if required.
+
     if(keep_going)
     {
-      it1 = degree_class.begin();
-      end = degree_class.end();
-      for(; it1!=end; ++it1)
+      for(int i = 0; i < nb_classes; ++i)
       {
-        random_ensemble_kappa_per_degree_class[*it1] += (*it1 - random_ensemble_expected_degree_per_degree_class[*it1]) * uniform_01(engine);
-        random_ensemble_kappa_per_degree_class[*it1] = std::fabs(random_ensemble_kappa_per_degree_class[*it1]);
+        class_kappa[i] += (degree_class_values_cache[i] - class_expected_degree[i]) * uniform_01(engine);
+        class_kappa[i] = std::fabs(class_kappa[i]);
       }
     }
     ++cnt;
   }
+
+  for(int i = 0; i < nb_classes; ++i)
+  {
+    const int degree_value = degree_class_values_cache[i];
+    random_ensemble_kappa_per_degree_class[degree_value] = class_kappa[i];
+    random_ensemble_expected_degree_per_degree_class[degree_value] = class_expected_degree[i];
+  }
+  degree_class_pair_prob_cache.swap(pair_prob_cache);
+  degree_class_pair_prob_cache_valid = true;
+
   if(cnt >= KAPPA_MAX_NB_ITER_CONV)
   {
     if(!QUIET_MODE) {
