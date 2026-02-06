@@ -34,3 +34,6 @@ cmake-build-release
 !lib/*
 lib/__pycache__
 test/__pycache__
+test_*.out
+test_*.err
+build-cuda/
