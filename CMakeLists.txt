@@ -64,6 +64,6 @@ target_link_libraries(mercator PRIVATE trapecis_Sd Threads::Threads OpenMP::Open
 if(DMERCATOR_ENABLE_CUDA)
   find_package(CUDAToolkit REQUIRED)
   target_compile_definitions(mercator PRIVATE DMERCATOR_USE_CUDA=1)
-  target_link_libraries(mercator PRIVATE CUDA::cudart)
+  target_link_libraries(mercator PRIVATE CUDA::cudart CUDA::curand)
   set_target_properties(mercator PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 endif()

@@ -31,6 +31,8 @@ class LikelihoodBackend
     int nb_vertices() const;
 
     bool update_kappa(const std::vector<double> &kappa, std::string *error_message);
+    bool download_kappa(std::vector<double> &kappa, std::string *error_message);
+    bool update_observed_degree(const std::vector<int> &degree, std::string *error_message);
     bool update_theta(const std::vector<double> &theta, std::string *error_message);
     bool update_theta_entry(int vertex_id, double theta_value, std::string *error_message);
 
@@ -60,6 +62,45 @@ class LikelihoodBackend
                              const std::vector<double> &candidate_positions_soa,
                              std::vector<double> &out_scores,
                              std::string *error_message);
+
+    // Executes one CUDA iteration of hidden-degree refinement in S^1.
+    // Returns the maximal per-vertex expected-degree mismatch for convergence checks.
+    bool run_kappa_iteration_s1(double prefactor,
+                                double beta,
+                                double convergence_threshold,
+                                unsigned long long seed,
+                                int iteration,
+                                double *out_max_abs_error,
+                                std::string *error_message);
+
+    // Executes one CUDA iteration of hidden-degree refinement in S^D.
+    bool run_kappa_iteration_sd(int dim,
+                                double radius,
+                                double mu,
+                                double beta,
+                                double convergence_threshold,
+                                unsigned long long seed,
+                                int iteration,
+                                double *out_max_abs_error,
+                                std::string *error_message);
+
+    // Monte Carlo estimate of the expected mean clustering in S^1.
+    bool estimate_mean_clustering_s1(double prefactor,
+                                     double beta,
+                                     unsigned long long seed,
+                                     int nb_samples,
+                                     double *out_mean_clustering,
+                                     std::string *error_message);
+
+    // Monte Carlo estimate of the expected mean clustering in S^D.
+    bool estimate_mean_clustering_sd(int dim,
+                                     double radius,
+                                     double mu,
+                                     double beta,
+                                     unsigned long long seed,
+                                     int nb_samples,
+                                     double *out_mean_clustering,
+                                     std::string *error_message);
 
   private:
     struct Impl;

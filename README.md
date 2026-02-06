@@ -38,7 +38,11 @@ chmod +x build.sh
 
 #### CUDA backend (optional)
 
-The CUDA path accelerates the refinement likelihood scoring loops (edge and non-edge terms) and keeps the rest of the pipeline unchanged.
+The CUDA path accelerates:
+* refinement likelihood scoring loops (edge and non-edge terms),
+* hidden-degree (`kappa`) inference updates,
+* Monte Carlo clustering evaluation used during `beta` inference,
+while keeping CLI/Python interfaces unchanged and preserving CPU fallback.
 
 Requirements
 * NVIDIA CUDA toolkit (with `nvcc`)
@@ -57,8 +61,8 @@ cmake --build build-cuda -j 8
 ```
 
 Runtime selection:
-* CUDA-enabled binary uses GPU scoring by default.
-* Set `DMERCATOR_DISABLE_CUDA=1` to force CPU scoring at runtime (useful for A/B validation).
+* CUDA-enabled binary uses GPU acceleration by default.
+* Set `DMERCATOR_DISABLE_CUDA=1` to force runtime CPU execution (useful for A/B validation).
 
 Optional reproducibility diagnostics:
 * Set `DMERCATOR_TRACE_LOGLIKELIHOOD=1` to save chunk-wise likelihood progression to `*.inf_ll_trace`.
@@ -148,6 +152,14 @@ The test compares:
 * inferred `beta`/`mu`,
 * inferred node scalars (`kappa`, radial coordinate) and positional consistency,
 * likelihood progression from `*.inf_ll_trace`.
+
+CPU vs GPU beta/kappa inference A/B test (post-processing and kappa-only paths):
+
+```bash
+python3 test/cuda_cpu_kappa_beta_ab.py \
+  --cpu-bin /path/to/mercator_cpu \
+  --gpu-bin /path/to/mercator_cuda
+```
 
 
 ### Output files

@@ -144,7 +144,7 @@ class embeddingSD_t
     // Various numerical/convergence thresholds.
     const double NUMERICAL_CONVERGENCE_THRESHOLD_1 = 1e-2;
     const double NUMERICAL_CONVERGENCE_THRESHOLD_2 = 5e-5;
-    const double NUMERICAL_CONVERGENCE_THRESHOLD_3 = 0.5;
+    const double NUMERICAL_CONVERGENCE_THRESHOLD_3 = 1e-2;
     // double MAXIMIZATION_CONVERGENCE_THRESHOLD = 0.01;
     const double NUMERICAL_ZERO = 1e-10;
     // // Parameter governing the refinied search for optimal position during the maximization phase.
@@ -2019,25 +2019,95 @@ void embeddingSD_t::infer_kappas_given_beta_for_all_vertices(int dim)
 {
   if(!QUIET_MODE) { std::clog << "Updating values of kappa based on inferred positions..." << std::endl; }
   if(!QUIET_MODE) { std::clog.flush(); }
-  // Finds the values of kappa generating the degree classes, given the parameters.
-  int cnt = 0;
-  bool keep_going = true;
   const double radius = compute_radius(dim, nb_vertices);
-  while (keep_going && (cnt < KAPPA_MAX_NB_ITER_CONV))
+  int cnt = 0;
+  bool converged = false;
+
+#ifdef DMERCATOR_USE_CUDA
+  if(cuda_available && cuda_backend)
   {
-    // Updates the expected degree of individual vertices.
+    std::string error_message;
+    bool ready = prepare_cuda_refinement_sd(dim);
+    if(ready && !cuda_backend->update_observed_degree(degree, &error_message))
+    {
+      ready = false;
+      if(!QUIET_MODE)
+      {
+        std::clog << TAB << "WARNING: CUDA fallback to CPU (degree upload failed): " << error_message << std::endl;
+      }
+    }
+
+    if(ready)
+    {
+      const unsigned long long kappa_seed = static_cast<unsigned long long>(SEED) ^ 0x517cc1b727220a95ULL;
+      bool cuda_failed = false;
+      while(cnt < KAPPA_MAX_NB_ITER_CONV)
+      {
+        double max_abs_error = 0;
+        if(!cuda_backend->run_kappa_iteration_sd(dim,
+                                                 radius,
+                                                 mu,
+                                                 beta,
+                                                 NUMERICAL_CONVERGENCE_THRESHOLD_3,
+                                                 kappa_seed,
+                                                 cnt,
+                                                 &max_abs_error,
+                                                 &error_message))
+        {
+          if(!QUIET_MODE)
+          {
+            std::clog << TAB << "WARNING: CUDA fallback to CPU (kappa iteration failed): " << error_message << std::endl;
+          }
+          cuda_failed = true;
+          break;
+        }
+        ++cnt;
+        if(max_abs_error <= NUMERICAL_CONVERGENCE_THRESHOLD_3)
+        {
+          converged = true;
+          break;
+        }
+      }
+
+      if(!cuda_failed && cuda_backend->download_kappa(kappa, &error_message))
+      {
+        if(converged)
+        {
+          if(!QUIET_MODE) { std::clog << TAB << "Convergence reached after " << cnt << " iterations." << std::endl; }
+        }
+        else if(!QUIET_MODE)
+        {
+          std::clog << TAB << "WARNING: maximum number of iterations reached before convergence. This limit can be"  << std::endl;
+          std::clog << TAB << "         adjusted by setting the parameters KAPPA_MAX_NB_ITER_CONV to desired value." << std::endl;
+        }
+        if(!QUIET_MODE) { std::clog << "                                                       ...............................done." << std::endl; }
+        return;
+      }
+      if(cuda_failed)
+      {
+        cuda_backend->download_kappa(kappa, nullptr);
+      }
+      else if(!QUIET_MODE)
+      {
+        std::clog << TAB << "WARNING: CUDA fallback to CPU (kappa download failed): " << error_message << std::endl;
+      }
+    }
+  }
+#endif
+
+  // CPU fallback.
+  bool keep_going = true;
+  while(keep_going && (cnt < KAPPA_MAX_NB_ITER_CONV))
+  {
     compute_inferred_ensemble_expected_degrees(dim, radius);
-    // Verifies convergence.
     keep_going = false;
     for(int v(0); v<nb_vertices; ++v)
     {
       if(std::fabs(inferred_ensemble_expected_degree[v] - degree[v]) > NUMERICAL_CONVERGENCE_THRESHOLD_3)
       {
         keep_going = true;
-        continue;
       }
     }
-    // Modifies the value of the kappas prior to the next iteration, if required.
     if(keep_going)
     {
       for(int v(0); v<nb_vertices; ++v)
@@ -2048,7 +2118,7 @@ void embeddingSD_t::infer_kappas_given_beta_for_all_vertices(int dim)
     }
     ++cnt;
   }
-  // Resets the values of kappa since convergence has not been reached.
+
   if(cnt >= KAPPA_MAX_NB_ITER_CONV)
   {
     if(!QUIET_MODE) { std::clog << TAB << "WARNING: maximum number of iterations reached before convergence. This limit can be"  << std::endl; }
@@ -2066,31 +2136,75 @@ void embeddingSD_t::infer_kappas_beta_for_all_vertices(int dim)
 {
   const double BETA_ABS_MIN_DIM = dim + 0.01;
   const double BETA_ABS_MAX_DIM = dim + 100; // what should be the maximum beta?
-  double beta_max = -1;
-  double beta_min = dim;
-  while(true)
+  constexpr int MAX_BRACKET_EXPANSIONS = 24;
+  constexpr int MAX_BISECTION_STEPS = 32;
+  const int MC_SAMPLES = std::max(8192, nb_vertices_degree_gt_one * 128);
+  const double target_clustering = average_clustering;
+  const double radius = compute_radius(dim, nb_vertices);
+  int mc_eval_id = 0;
+
+  auto evaluate_beta = [&](double beta_candidate) -> double
   {
-    if(!QUIET_MODE) {
+    beta = beta_candidate;
+    if(!QUIET_MODE)
+    {
       std::clog << TAB;
       std::clog << std::fixed << std::setw(11) << beta << " ";
       std::clog.flush();
     }
+
     mu = calculate_mu(dim);
-    // Readjust the values of kappa.
     infer_kappas_given_beta_for_all_vertices(dim);
-  
-    // Compute the clustering from generated synthetic networks with the inferred positions
+
+#ifdef DMERCATOR_USE_CUDA
+    if(cuda_available && cuda_backend)
+    {
+      std::string error_message;
+      bool ready = prepare_cuda_refinement_sd(dim);
+      if(ready && !cuda_backend->update_observed_degree(degree, &error_message))
+      {
+        ready = false;
+      }
+      if(ready)
+      {
+        const unsigned long long clustering_seed =
+          (static_cast<unsigned long long>(SEED) ^ 0x9e3779b97f4a7c15ULL) +
+          static_cast<unsigned long long>(mc_eval_id++);
+        double estimated_clustering = 0;
+        if(cuda_backend->estimate_mean_clustering_sd(dim,
+                                                     radius,
+                                                     mu,
+                                                     beta,
+                                                     clustering_seed,
+                                                     MC_SAMPLES,
+                                                     &estimated_clustering,
+                                                     &error_message))
+        {
+          random_ensemble_average_clustering = estimated_clustering;
+          if(!QUIET_MODE)
+          {
+            std::clog << std::fixed << std::setw(20) << random_ensemble_average_clustering << " \n";
+          }
+          return random_ensemble_average_clustering;
+        }
+      }
+      if(!QUIET_MODE)
+      {
+        std::clog << TAB << "WARNING: CUDA fallback to CPU (clustering MC failed): " << error_message << std::endl;
+      }
+    }
+#endif
+
     const int NTIMES = 5;
     random_ensemble_average_clustering = 0;
-
-    for (int i=0; i<NTIMES; ++i) {
+    for(int i = 0; i < NTIMES; ++i)
+    {
       generate_simulated_adjacency_list(dim, false);
       analyze_simulated_adjacency_list();
       double current_clustering = 0;
-
-      for(int v1(0); v1<nb_vertices; ++v1)
+      for(int v1 = 0; v1 < nb_vertices; ++v1)
       {
-        int d1 = simulated_degree[v1];
+        const int d1 = simulated_degree[v1];
         if(d1 > 1)
         {
           auto value = simulated_nb_triangles[v1];
@@ -2101,68 +2215,182 @@ void embeddingSD_t::infer_kappas_beta_for_all_vertices(int dim)
       random_ensemble_average_clustering += current_clustering / nb_vertices_degree_gt_one;
     }
     random_ensemble_average_clustering /= NTIMES;
-    
-    if(!QUIET_MODE) { std::clog << std::fixed << std::setw(20) << random_ensemble_average_clustering << " \n"; }
-
-    if(std::fabs(random_ensemble_average_clustering - average_clustering) < 0.05)
-      break;
-
-    if(random_ensemble_average_clustering > average_clustering)
+    if(!QUIET_MODE)
     {
-      beta_max = beta;
-      beta = (beta_max + beta_min) / 2;
-      if(beta < BETA_ABS_MIN_DIM)
+      std::clog << std::fixed << std::setw(20) << random_ensemble_average_clustering << " \n";
+    }
+    return random_ensemble_average_clustering;
+  };
+
+  double beta_low = BETA_ABS_MIN_DIM;
+  double beta_high = BETA_ABS_MAX_DIM;
+  double c_low = 0;
+  double c_high = 0;
+  bool bracketed = false;
+
+  const double beta_start = std::min(BETA_ABS_MAX_DIM, std::max(BETA_ABS_MIN_DIM, dim + 0.5));
+  const double c_start = evaluate_beta(beta_start);
+  if(std::fabs(c_start - target_clustering) < NUMERICAL_CONVERGENCE_THRESHOLD_1)
+  {
+    return;
+  }
+
+  if(c_start > target_clustering)
+  {
+    c_low = evaluate_beta(BETA_ABS_MIN_DIM);
+    beta_low = BETA_ABS_MIN_DIM;
+    c_high = c_start;
+    beta_high = beta_start;
+    bracketed = (c_low <= target_clustering);
+    if(!bracketed)
+    {
+      beta = beta_low;
+      random_ensemble_average_clustering = c_low;
+      if(!QUIET_MODE)
       {
-        if(!QUIET_MODE)
-          std::clog << "WARNING: value too close to 1, using beta = " << std::fixed << std::setw(11) << beta << ".\n";
+        std::clog << "WARNING: value too close to D, using beta = " << std::fixed << std::setw(11) << beta << ".\n";
+      }
+      return;
+    }
+  }
+  else
+  {
+    beta_low = beta_start;
+    c_low = c_start;
+    beta_high = beta_start;
+    c_high = c_start;
+    for(int i = 0; i < MAX_BRACKET_EXPANSIONS; ++i)
+    {
+      const double next_beta = std::min(BETA_ABS_MAX_DIM, beta_high * 1.5);
+      if(next_beta <= beta_high + NUMERICAL_ZERO)
+      {
+        break;
+      }
+      c_high = evaluate_beta(next_beta);
+      beta_high = next_beta;
+      if(std::fabs(c_high - target_clustering) < NUMERICAL_CONVERGENCE_THRESHOLD_1)
+      {
+        return;
+      }
+      if(c_high >= target_clustering)
+      {
+        bracketed = true;
+        break;
+      }
+      if(beta_high >= BETA_ABS_MAX_DIM - NUMERICAL_ZERO)
+      {
         break;
       }
     }
-    else
+    if(!bracketed)
     {
-      beta_min = beta;
-      if(beta_max == -1)
-        beta *= 1.5;
-      else
-        beta = (beta_max + beta_min) / 2;
-    }
-    if(beta > BETA_ABS_MAX_DIM)
-    {
+      beta = beta_high;
+      random_ensemble_average_clustering = c_high;
       if(!QUIET_MODE)
+      {
         std::clog << "WARNING: value too high, using beta = " << std::fixed << std::setw(11) << beta << ".\n";
-      break;
+      }
+      return;
     }
   }
+
+  for(int step = 0; step < MAX_BISECTION_STEPS; ++step)
+  {
+    const double beta_mid = (beta_low + beta_high) / 2;
+    const double c_mid = evaluate_beta(beta_mid);
+    if(std::fabs(c_mid - target_clustering) < NUMERICAL_CONVERGENCE_THRESHOLD_1 ||
+       std::fabs(beta_high - beta_low) < NUMERICAL_CONVERGENCE_THRESHOLD_2)
+    {
+      beta = beta_mid;
+      random_ensemble_average_clustering = c_mid;
+      return;
+    }
+    if(c_mid > target_clustering)
+    {
+      beta_high = beta_mid;
+      c_high = c_mid;
+    }
+    else
+    {
+      beta_low = beta_mid;
+      c_low = c_mid;
+    }
+  }
+
+  beta = (beta_low + beta_high) / 2;
+  random_ensemble_average_clustering = evaluate_beta(beta);
 }
 
 
 void embeddingSD_t::infer_kappas_beta_for_all_vertices()
 {
-  double beta_max = -1;
-  double beta_min = 1;
-  while(true)
+  constexpr int MAX_BRACKET_EXPANSIONS = 24;
+  constexpr int MAX_BISECTION_STEPS = 32;
+  const int MC_SAMPLES = std::max(8192, nb_vertices_degree_gt_one * 128);
+  const double target_clustering = average_clustering;
+  int mc_eval_id = 0;
+
+  auto evaluate_beta = [&](double beta_candidate) -> double
   {
-    if(!QUIET_MODE) {
+    beta = beta_candidate;
+    if(!QUIET_MODE)
+    {
       std::clog << TAB;
       std::clog << std::fixed << std::setw(11) << beta << " ";
       std::clog.flush();
     }
+
     mu = calculateMu();
-    // Readjust the values of kappa.
     infer_kappas_given_beta_for_all_vertices();
-  
-    // Compute the clustering from generated synthetic networks with the inferred positions
+
+#ifdef DMERCATOR_USE_CUDA
+    if(cuda_available && cuda_backend)
+    {
+      std::string error_message;
+      bool ready = prepare_cuda_refinement_s1();
+      if(ready && !cuda_backend->update_observed_degree(degree, &error_message))
+      {
+        ready = false;
+      }
+      if(ready)
+      {
+        const double prefactor = nb_vertices / (2 * PI * mu);
+        const unsigned long long clustering_seed =
+          (static_cast<unsigned long long>(SEED) ^ 0x9e3779b97f4a7c15ULL) +
+          static_cast<unsigned long long>(mc_eval_id++);
+        double estimated_clustering = 0;
+        if(cuda_backend->estimate_mean_clustering_s1(prefactor,
+                                                     beta,
+                                                     clustering_seed,
+                                                     MC_SAMPLES,
+                                                     &estimated_clustering,
+                                                     &error_message))
+        {
+          random_ensemble_average_clustering = estimated_clustering;
+          if(!QUIET_MODE)
+          {
+            std::clog << std::fixed << std::setw(20) << random_ensemble_average_clustering << " \n";
+          }
+          return random_ensemble_average_clustering;
+        }
+      }
+      if(!QUIET_MODE)
+      {
+        std::clog << TAB << "WARNING: CUDA fallback to CPU (clustering MC failed): " << error_message << std::endl;
+      }
+    }
+#endif
+
     const int NTIMES = 5;
     random_ensemble_average_clustering = 0;
-
-    for (int i=0; i<NTIMES; ++i) {
+    for(int i = 0; i < NTIMES; ++i)
+    {
       generate_simulated_adjacency_list();
       analyze_simulated_adjacency_list();
       double current_clustering = 0;
-
-      for(int v1(0); v1<nb_vertices; ++v1)
+      for(int v1 = 0; v1 < nb_vertices; ++v1)
       {
-        int d1 = simulated_degree[v1];
+        const int d1 = simulated_degree[v1];
         if(d1 > 1)
         {
           auto value = simulated_nb_triangles[v1];
@@ -2173,38 +2401,110 @@ void embeddingSD_t::infer_kappas_beta_for_all_vertices()
       random_ensemble_average_clustering += current_clustering / nb_vertices_degree_gt_one;
     }
     random_ensemble_average_clustering /= NTIMES;
-    
-    if(!QUIET_MODE) { std::clog << std::fixed << std::setw(20) << random_ensemble_average_clustering << " \n"; }
-
-    if( std::fabs(random_ensemble_average_clustering - average_clustering) < 0.05)
-      break;
-
-    if(random_ensemble_average_clustering > average_clustering)
+    if(!QUIET_MODE)
     {
-      beta_max = beta;
-      beta = (beta_max + beta_min) / 2;
-      if(beta < BETA_ABS_MIN)
+      std::clog << std::fixed << std::setw(20) << random_ensemble_average_clustering << " \n";
+    }
+    return random_ensemble_average_clustering;
+  };
+
+  double beta_low = BETA_ABS_MIN;
+  double beta_high = BETA_ABS_MAX;
+  double c_low = 0;
+  double c_high = 0;
+  bool bracketed = false;
+
+  const double beta_start = std::min(BETA_ABS_MAX, std::max(BETA_ABS_MIN, 1.5));
+  const double c_start = evaluate_beta(beta_start);
+  if(std::fabs(c_start - target_clustering) < NUMERICAL_CONVERGENCE_THRESHOLD_1)
+  {
+    return;
+  }
+
+  if(c_start > target_clustering)
+  {
+    c_low = evaluate_beta(BETA_ABS_MIN);
+    beta_low = BETA_ABS_MIN;
+    c_high = c_start;
+    beta_high = beta_start;
+    bracketed = (c_low <= target_clustering);
+    if(!bracketed)
+    {
+      beta = beta_low;
+      random_ensemble_average_clustering = c_low;
+      if(!QUIET_MODE)
       {
-        if(!QUIET_MODE)
-          std::clog << "WARNING: value too close to 1, using beta = " << std::fixed << std::setw(11) << beta << ".\n";
+        std::clog << "WARNING: value too close to 1, using beta = " << std::fixed << std::setw(11) << beta << ".\n";
+      }
+      return;
+    }
+  }
+  else
+  {
+    beta_low = beta_start;
+    c_low = c_start;
+    beta_high = beta_start;
+    c_high = c_start;
+    for(int i = 0; i < MAX_BRACKET_EXPANSIONS; ++i)
+    {
+      const double next_beta = std::min(BETA_ABS_MAX, beta_high * 1.5);
+      if(next_beta <= beta_high + NUMERICAL_ZERO)
+      {
+        break;
+      }
+      c_high = evaluate_beta(next_beta);
+      beta_high = next_beta;
+      if(std::fabs(c_high - target_clustering) < NUMERICAL_CONVERGENCE_THRESHOLD_1)
+      {
+        return;
+      }
+      if(c_high >= target_clustering)
+      {
+        bracketed = true;
+        break;
+      }
+      if(beta_high >= BETA_ABS_MAX - NUMERICAL_ZERO)
+      {
         break;
       }
     }
-    else
+    if(!bracketed)
     {
-      beta_min = beta;
-      if(beta_max == -1)
-        beta *= 1.5;
-      else
-        beta = (beta_max + beta_min) / 2;
-    }
-    if(beta > BETA_ABS_MAX)
-    {
+      beta = beta_high;
+      random_ensemble_average_clustering = c_high;
       if(!QUIET_MODE)
+      {
         std::clog << "WARNING: value too high, using beta = " << std::fixed << std::setw(11) << beta << ".\n";
-      break;
+      }
+      return;
     }
   }
+
+  for(int step = 0; step < MAX_BISECTION_STEPS; ++step)
+  {
+    const double beta_mid = (beta_low + beta_high) / 2;
+    const double c_mid = evaluate_beta(beta_mid);
+    if(std::fabs(c_mid - target_clustering) < NUMERICAL_CONVERGENCE_THRESHOLD_1 ||
+       std::fabs(beta_high - beta_low) < NUMERICAL_CONVERGENCE_THRESHOLD_2)
+    {
+      beta = beta_mid;
+      random_ensemble_average_clustering = c_mid;
+      return;
+    }
+    if(c_mid > target_clustering)
+    {
+      beta_high = beta_mid;
+      c_high = c_mid;
+    }
+    else
+    {
+      beta_low = beta_mid;
+      c_low = c_mid;
+    }
+  }
+
+  beta = (beta_low + beta_high) / 2;
+  random_ensemble_average_clustering = evaluate_beta(beta);
 }
 
 // =~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=~=
@@ -2213,24 +2513,92 @@ void embeddingSD_t::infer_kappas_given_beta_for_all_vertices()
 {
   if(!QUIET_MODE) { std::clog << "Updating values of kappa based on inferred positions..." << std::endl; }
   if(!QUIET_MODE) { std::clog.flush(); }
-  // Finds the values of kappa generating the degree classes, given the parameters.
   int cnt = 0;
-  bool keep_going = true;
-  while( keep_going && (cnt < KAPPA_MAX_NB_ITER_CONV) )
+  bool converged = false;
+
+#ifdef DMERCATOR_USE_CUDA
+  if(cuda_available && cuda_backend)
   {
-    // Updates the expected degree of individual vertices.
+    std::string error_message;
+    bool ready = prepare_cuda_refinement_s1();
+    if(ready && !cuda_backend->update_observed_degree(degree, &error_message))
+    {
+      ready = false;
+      if(!QUIET_MODE)
+      {
+        std::clog << TAB << "WARNING: CUDA fallback to CPU (degree upload failed): " << error_message << std::endl;
+      }
+    }
+
+    if(ready)
+    {
+      const double prefactor = nb_vertices / (2 * PI * mu);
+      const unsigned long long kappa_seed = static_cast<unsigned long long>(SEED) ^ 0x517cc1b727220a95ULL;
+      bool cuda_failed = false;
+      while(cnt < KAPPA_MAX_NB_ITER_CONV)
+      {
+        double max_abs_error = 0;
+        if(!cuda_backend->run_kappa_iteration_s1(prefactor,
+                                                 beta,
+                                                 NUMERICAL_CONVERGENCE_THRESHOLD_3,
+                                                 kappa_seed,
+                                                 cnt,
+                                                 &max_abs_error,
+                                                 &error_message))
+        {
+          if(!QUIET_MODE)
+          {
+            std::clog << TAB << "WARNING: CUDA fallback to CPU (kappa iteration failed): " << error_message << std::endl;
+          }
+          cuda_failed = true;
+          break;
+        }
+        ++cnt;
+        if(max_abs_error <= NUMERICAL_CONVERGENCE_THRESHOLD_3)
+        {
+          converged = true;
+          break;
+        }
+      }
+
+      if(!cuda_failed && cuda_backend->download_kappa(kappa, &error_message))
+      {
+        if(converged)
+        {
+          if(!QUIET_MODE) { std::clog << TAB << "Convergence reached after " << cnt << " iterations." << std::endl; }
+        }
+        else if(!QUIET_MODE)
+        {
+          std::clog << TAB << "WARNING: maximum number of iterations reached before convergence. This limit can be"  << std::endl;
+          std::clog << TAB << "         adjusted by setting the parameters KAPPA_MAX_NB_ITER_CONV to desired value." << std::endl;
+        }
+        if(!QUIET_MODE) { std::clog << "                                                       ...............................done." << std::endl; }
+        return;
+      }
+      if(cuda_failed)
+      {
+        cuda_backend->download_kappa(kappa, nullptr);
+      }
+      else if(!QUIET_MODE)
+      {
+        std::clog << TAB << "WARNING: CUDA fallback to CPU (kappa download failed): " << error_message << std::endl;
+      }
+    }
+  }
+#endif
+
+  bool keep_going = true;
+  while(keep_going && (cnt < KAPPA_MAX_NB_ITER_CONV))
+  {
     compute_inferred_ensemble_expected_degrees();
-    // Verifies convergence.
     keep_going = false;
     for(int v(0); v<nb_vertices; ++v)
     {
       if(std::fabs(inferred_ensemble_expected_degree[v] - degree[v]) > NUMERICAL_CONVERGENCE_THRESHOLD_3)
       {
         keep_going = true;
-        continue;
       }
     }
-    // Modifies the value of the kappas prior to the next iteration, if required.
     if(keep_going)
     {
       for(int v(0); v<nb_vertices; ++v)
@@ -2241,7 +2609,7 @@ void embeddingSD_t::infer_kappas_given_beta_for_all_vertices()
     }
     ++cnt;
   }
-  // Resets the values of kappa since convergence has not been reached.
+
   if(cnt >= KAPPA_MAX_NB_ITER_CONV)
   {
     if(!QUIET_MODE) { std::clog << TAB << "WARNING: maximum number of iterations reached before convergence. This limit can be"  << std::endl; }
@@ -3093,7 +3461,7 @@ void embeddingSD_t::initialize_cuda_backend()
   cuda_available = true;
   if(!QUIET_MODE)
   {
-    std::clog << TAB << "CUDA backend: enabled for refinement scoring." << std::endl;
+    std::clog << TAB << "CUDA backend: enabled for refinement, kappa, and beta inference." << std::endl;
   }
 }
 
