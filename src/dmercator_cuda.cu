@@ -43,6 +43,26 @@ __device__ __forceinline__ void atomic_max_nonneg_double(unsigned long long *add
   atomicMax(address, static_cast<unsigned long long>(__double_as_longlong(value)));
 }
 
+__device__ __forceinline__ double atomic_add_double(double *address, double value)
+{
+#if __CUDA_ARCH__ >= 600
+  return atomicAdd(address, value);
+#else
+  // Compatibility path for architectures where atomicAdd(double*) is unavailable.
+  unsigned long long *address_as_ull = reinterpret_cast<unsigned long long *>(address);
+  unsigned long long old = *address_as_ull;
+  unsigned long long assumed = 0;
+  do
+  {
+    assumed = old;
+    old = atomicCAS(address_as_ull,
+                    assumed,
+                    __double_as_longlong(value + __longlong_as_double(assumed)));
+  } while(assumed != old);
+  return __longlong_as_double(old);
+#endif
+}
+
 __device__ __forceinline__ unsigned long long splitmix64(unsigned long long x)
 {
   x += 0x9e3779b97f4a7c15ULL;
@@ -350,13 +370,13 @@ __global__ void expected_degree_s1_kernel(const double *theta,
   {
     const double prob = connection_probability_s1(theta1, theta[v2], kappa1, kappa[v2], prefactor, beta);
     local_sum += prob;
-    atomicAdd(expected_degree + v2, prob);
+    atomic_add_double(expected_degree + v2, prob);
   }
 
   const double block_sum = block_reduce_sum<BLOCK_SIZE>(local_sum);
   if(threadIdx.x == 0)
   {
-    atomicAdd(expected_degree + v1, block_sum);
+    atomic_add_double(expected_degree + v1, block_sum);
   }
 }
 
@@ -394,13 +414,13 @@ __global__ void expected_degree_sd_kernel(const double *positions_soa,
                                                   beta,
                                                   inv_dim);
     local_sum += prob;
-    atomicAdd(expected_degree + v2, prob);
+    atomic_add_double(expected_degree + v2, prob);
   }
 
   const double block_sum = block_reduce_sum<BLOCK_SIZE>(local_sum);
   if(threadIdx.x == 0)
   {
-    atomicAdd(expected_degree + v1, block_sum);
+    atomic_add_double(expected_degree + v1, block_sum);
   }
 }
 
@@ -484,8 +504,8 @@ __global__ void clustering_mc_s1_kernel(const double *theta,
   const double block_den = block_reduce_sum<BLOCK_SIZE>(local_den);
   if(threadIdx.x == 0)
   {
-    atomicAdd(out_numerator, block_num);
-    atomicAdd(out_denominator, block_den);
+    atomic_add_double(out_numerator, block_num);
+    atomic_add_double(out_denominator, block_den);
   }
 }
 
@@ -561,8 +581,8 @@ __global__ void clustering_mc_sd_kernel(const double *positions_soa,
   const double block_den = block_reduce_sum<BLOCK_SIZE>(local_den);
   if(threadIdx.x == 0)
   {
-    atomicAdd(out_numerator, block_num);
-    atomicAdd(out_denominator, block_den);
+    atomic_add_double(out_numerator, block_num);
+    atomic_add_double(out_denominator, block_den);
   }
 }
 
