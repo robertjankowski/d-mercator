@@ -81,6 +81,31 @@ __device__ __forceinline__ double deterministic_uniform_01(unsigned long long se
   return static_cast<double>(value >> 11) * (1.0 / 9007199254740992.0);
 }
 
+__device__ __forceinline__ double deterministic_uniform_01_u64(unsigned long long seed,
+                                                               unsigned long long index,
+                                                               unsigned long long stream)
+{
+  unsigned long long value = seed ^ (index * 0x9e3779b97f4a7c15ULL);
+  value ^= (stream + 1ULL) * 0xbf58476d1ce4e5b9ULL;
+  value = splitmix64(value);
+  return static_cast<double>(value >> 11) * (1.0 / 9007199254740992.0);
+}
+
+__device__ __forceinline__ void pair_from_upper_index(unsigned long long idx,
+                                                       int nb_vertices,
+                                                       int *v1,
+                                                       int *v2)
+{
+  const double b = 2.0 * static_cast<double>(nb_vertices) - 1.0;
+  const double disc = b * b - 8.0 * static_cast<double>(idx);
+  const int row = static_cast<int>(floor((b - sqrt(disc)) * 0.5));
+  const unsigned long long row_start =
+    static_cast<unsigned long long>(row) * static_cast<unsigned long long>(nb_vertices) -
+    (static_cast<unsigned long long>(row) * static_cast<unsigned long long>(row + 1)) / 2ULL;
+  *v1 = row;
+  *v2 = row + 1 + static_cast<int>(idx - row_start);
+}
+
 __device__ __forceinline__ double wrap_angle_difference(double a1, double a2)
 {
   return PI - fabs(PI - fabs(a1 - a2));
@@ -586,6 +611,228 @@ __global__ void clustering_mc_sd_kernel(const double *positions_soa,
   }
 }
 
+__device__ __forceinline__ bool has_edge_csr(int v1,
+                                             int v2,
+                                             const int *row_offsets,
+                                             const int *col_indices)
+{
+  int left = row_offsets[v1];
+  int right = row_offsets[v1 + 1] - 1;
+  while(left <= right)
+  {
+    const int mid = left + ((right - left) / 2);
+    const int candidate = col_indices[mid];
+    if(candidate == v2)
+    {
+      return true;
+    }
+    if(candidate < v2)
+    {
+      left = mid + 1;
+    }
+    else
+    {
+      right = mid - 1;
+    }
+  }
+  return false;
+}
+
+__device__ __forceinline__ int find_bin_index(const double *bin_upper_bounds,
+                                              int nb_bins,
+                                              double value)
+{
+  int lo = 0;
+  int hi = nb_bins - 1;
+  while(lo < hi)
+  {
+    const int mid = lo + ((hi - lo) / 2);
+    if(value <= bin_upper_bounds[mid])
+    {
+      hi = mid;
+    }
+    else
+    {
+      lo = mid + 1;
+    }
+  }
+  return lo;
+}
+
+template <int BLOCK_SIZE>
+__global__ void sample_graph_s1_kernel(const double *theta,
+                                       const double *kappa,
+                                       int nb_vertices,
+                                       double prefactor,
+                                       double beta,
+                                       unsigned long long seed,
+                                       unsigned char *upper_triangle_edges)
+{
+  const unsigned long long total_pairs =
+    (static_cast<unsigned long long>(nb_vertices) * static_cast<unsigned long long>(nb_vertices - 1)) / 2ULL;
+  const unsigned long long stride = static_cast<unsigned long long>(BLOCK_SIZE) * gridDim.x;
+  unsigned long long idx = static_cast<unsigned long long>(blockIdx.x) * BLOCK_SIZE + threadIdx.x;
+
+  while(idx < total_pairs)
+  {
+    int v1 = 0;
+    int v2 = 0;
+    pair_from_upper_index(idx, nb_vertices, &v1, &v2);
+
+    const double prob = connection_probability_s1(theta[v1],
+                                                  theta[v2],
+                                                  kappa[v1],
+                                                  kappa[v2],
+                                                  prefactor,
+                                                  beta);
+    const double u = deterministic_uniform_01_u64(seed, idx, 0ULL);
+    upper_triangle_edges[idx] = (u < prob) ? static_cast<unsigned char>(1) : static_cast<unsigned char>(0);
+    idx += stride;
+  }
+}
+
+template <int BLOCK_SIZE>
+__global__ void sample_graph_sd_kernel(const double *positions_soa,
+                                       int dim_plus_one,
+                                       const double *kappa,
+                                       int nb_vertices,
+                                       double radius,
+                                       double mu,
+                                       double beta,
+                                       double inv_dim,
+                                       unsigned long long seed,
+                                       unsigned char *upper_triangle_edges)
+{
+  const unsigned long long total_pairs =
+    (static_cast<unsigned long long>(nb_vertices) * static_cast<unsigned long long>(nb_vertices - 1)) / 2ULL;
+  const unsigned long long stride = static_cast<unsigned long long>(BLOCK_SIZE) * gridDim.x;
+  unsigned long long idx = static_cast<unsigned long long>(blockIdx.x) * BLOCK_SIZE + threadIdx.x;
+
+  while(idx < total_pairs)
+  {
+    int v1 = 0;
+    int v2 = 0;
+    pair_from_upper_index(idx, nb_vertices, &v1, &v2);
+
+    const double prob = connection_probability_sd(positions_soa,
+                                                  dim_plus_one,
+                                                  nb_vertices,
+                                                  v1,
+                                                  v2,
+                                                  kappa[v1],
+                                                  kappa[v2],
+                                                  radius,
+                                                  mu,
+                                                  beta,
+                                                  inv_dim);
+    const double u = deterministic_uniform_01_u64(seed, idx, 1ULL);
+    upper_triangle_edges[idx] = (u < prob) ? static_cast<unsigned char>(1) : static_cast<unsigned char>(0);
+    idx += stride;
+  }
+}
+
+template <int BLOCK_SIZE>
+__global__ void histogram_pconn_s1_kernel(const double *theta,
+                                          const double *kappa,
+                                          int nb_vertices,
+                                          const int *row_offsets,
+                                          const int *col_indices,
+                                          const double *bin_upper_bounds,
+                                          int nb_bins,
+                                          double prefactor,
+                                          double beta,
+                                          double *hist_n,
+                                          double *hist_p,
+                                          double *hist_x)
+{
+  const unsigned long long total_pairs =
+    (static_cast<unsigned long long>(nb_vertices) * static_cast<unsigned long long>(nb_vertices - 1)) / 2ULL;
+  const unsigned long long stride = static_cast<unsigned long long>(BLOCK_SIZE) * gridDim.x;
+  unsigned long long idx = static_cast<unsigned long long>(blockIdx.x) * BLOCK_SIZE + threadIdx.x;
+
+  while(idx < total_pairs)
+  {
+    int v1 = 0;
+    int v2 = 0;
+    pair_from_upper_index(idx, nb_vertices, &v1, &v2);
+
+    const double dtheta = wrap_angle_difference(theta[v1], theta[v2]);
+    const double dist = (prefactor * dtheta) / (kappa[v1] * kappa[v2]);
+    const int bin_id = find_bin_index(bin_upper_bounds, nb_bins, dist);
+
+    atomic_add_double(hist_n + bin_id, 1.0);
+    atomic_add_double(hist_x + bin_id, dist);
+    if(has_edge_csr(v1, v2, row_offsets, col_indices))
+    {
+      atomic_add_double(hist_p + bin_id, 1.0);
+    }
+    idx += stride;
+  }
+}
+
+template <int BLOCK_SIZE>
+__global__ void histogram_pconn_sd_kernel(const double *positions_soa,
+                                          int dim_plus_one,
+                                          const double *kappa,
+                                          int nb_vertices,
+                                          const int *row_offsets,
+                                          const int *col_indices,
+                                          const double *bin_upper_bounds,
+                                          int nb_bins,
+                                          double radius,
+                                          double mu,
+                                          double beta,
+                                          double inv_dim,
+                                          double *hist_n,
+                                          double *hist_p,
+                                          double *hist_x)
+{
+  const unsigned long long total_pairs =
+    (static_cast<unsigned long long>(nb_vertices) * static_cast<unsigned long long>(nb_vertices - 1)) / 2ULL;
+  const unsigned long long stride = static_cast<unsigned long long>(BLOCK_SIZE) * gridDim.x;
+  unsigned long long idx = static_cast<unsigned long long>(blockIdx.x) * BLOCK_SIZE + threadIdx.x;
+
+  while(idx < total_pairs)
+  {
+    int v1 = 0;
+    int v2 = 0;
+    pair_from_upper_index(idx, nb_vertices, &v1, &v2);
+
+    double dot = 0;
+    double norm1 = 0;
+    double norm2 = 0;
+    for(int d = 0; d < dim_plus_one; ++d)
+    {
+      const double p1 = positions_soa[static_cast<size_t>(d) * nb_vertices + v1];
+      const double p2 = positions_soa[static_cast<size_t>(d) * nb_vertices + v2];
+      dot += p1 * p2;
+      norm1 += p1 * p1;
+      norm2 += p2 * p2;
+    }
+    const double denom = sqrt(norm1) * sqrt(norm2);
+    double cos_angle = dot / denom;
+    if(cos_angle > 1.0)
+    {
+      cos_angle = 1.0;
+    }
+    else if(cos_angle < -1.0)
+    {
+      cos_angle = -1.0;
+    }
+    const double dtheta = (fabs(cos_angle - 1.0) < NUMERICAL_ZERO) ? 0.0 : acos(cos_angle);
+    const double dist = radius * dtheta / pow(mu * kappa[v1] * kappa[v2], inv_dim);
+    const int bin_id = find_bin_index(bin_upper_bounds, nb_bins, dist);
+
+    atomic_add_double(hist_n + bin_id, 1.0);
+    atomic_add_double(hist_x + bin_id, dist);
+    if(has_edge_csr(v1, v2, row_offsets, col_indices))
+    {
+      atomic_add_double(hist_p + bin_id, 1.0);
+    }
+    idx += stride;
+  }
+}
+
 bool check_cuda(cudaError_t status, const std::string &context, std::string *error_message)
 {
   if(status == cudaSuccess)
@@ -620,6 +867,11 @@ struct LikelihoodBackend::Impl
   unsigned long long *d_max_error_bits = nullptr;
   double *d_clustering_numerator = nullptr;
   double *d_clustering_denominator = nullptr;
+  unsigned char *d_upper_triangle_edges = nullptr;
+  double *d_hist_n = nullptr;
+  double *d_hist_p = nullptr;
+  double *d_hist_x = nullptr;
+  double *d_hist_bins = nullptr;
 
   double *d_candidate_theta = nullptr;
   double *d_candidate_positions = nullptr;
@@ -627,6 +879,8 @@ struct LikelihoodBackend::Impl
 
   int candidate_capacity = 0;
   int candidate_position_capacity = 0;
+  size_t upper_triangle_capacity = 0;
+  int histogram_capacity = 0;
 
   bool initialized = false;
   bool has_kappa = false;
@@ -706,9 +960,36 @@ struct LikelihoodBackend::Impl
       cudaFree(d_clustering_denominator);
       d_clustering_denominator = nullptr;
     }
+    if(d_upper_triangle_edges)
+    {
+      cudaFree(d_upper_triangle_edges);
+      d_upper_triangle_edges = nullptr;
+    }
+    if(d_hist_n)
+    {
+      cudaFree(d_hist_n);
+      d_hist_n = nullptr;
+    }
+    if(d_hist_p)
+    {
+      cudaFree(d_hist_p);
+      d_hist_p = nullptr;
+    }
+    if(d_hist_x)
+    {
+      cudaFree(d_hist_x);
+      d_hist_x = nullptr;
+    }
+    if(d_hist_bins)
+    {
+      cudaFree(d_hist_bins);
+      d_hist_bins = nullptr;
+    }
 
     candidate_capacity = 0;
     candidate_position_capacity = 0;
+    upper_triangle_capacity = 0;
+    histogram_capacity = 0;
     dim_plus_one = 0;
     nb_vertices = 0;
     nb_degree_gt_one_vertices = 0;
@@ -1812,6 +2093,528 @@ bool LikelihoodBackend::estimate_mean_clustering_sd(int dim,
   if(out_mean_clustering)
   {
     *out_mean_clustering = (denominator > NUMERICAL_ZERO) ? (numerator / denominator) : 0.0;
+  }
+  return true;
+}
+
+bool LikelihoodBackend::sample_graph_s1(double prefactor,
+                                        double beta,
+                                        unsigned long long seed,
+                                        std::vector<unsigned char> &out_upper_triangle_edges,
+                                        std::string *error_message)
+{
+  if(!is_initialized())
+  {
+    if(error_message)
+    {
+      *error_message = "CUDA backend is not initialized.";
+    }
+    return false;
+  }
+  if(!impl_->has_kappa || !impl_->has_theta)
+  {
+    if(error_message)
+    {
+      *error_message = "Kappa/theta buffers are not initialized on device.";
+    }
+    return false;
+  }
+
+  const size_t pair_count =
+    (static_cast<size_t>(impl_->nb_vertices) * static_cast<size_t>(impl_->nb_vertices - 1)) / 2u;
+  out_upper_triangle_edges.resize(pair_count);
+  if(pair_count == 0)
+  {
+    return true;
+  }
+
+  if(pair_count > impl_->upper_triangle_capacity)
+  {
+    if(impl_->d_upper_triangle_edges)
+    {
+      cudaFree(impl_->d_upper_triangle_edges);
+      impl_->d_upper_triangle_edges = nullptr;
+    }
+    if(!check_cuda(cudaMalloc(reinterpret_cast<void **>(&impl_->d_upper_triangle_edges),
+                              pair_count * sizeof(unsigned char)),
+                   "cudaMalloc(d_upper_triangle_edges)", error_message))
+    {
+      return false;
+    }
+    impl_->upper_triangle_capacity = pair_count;
+  }
+
+  constexpr int BLOCK_SIZE = 256;
+  int blocks = static_cast<int>((pair_count + static_cast<size_t>(BLOCK_SIZE) - 1) / static_cast<size_t>(BLOCK_SIZE));
+  if(blocks > 65535)
+  {
+    blocks = 65535;
+  }
+
+  sample_graph_s1_kernel<BLOCK_SIZE><<<blocks, BLOCK_SIZE>>>(impl_->d_theta,
+                                                              impl_->d_kappa,
+                                                              impl_->nb_vertices,
+                                                              prefactor,
+                                                              beta,
+                                                              seed,
+                                                              impl_->d_upper_triangle_edges);
+  if(!check_cuda(cudaGetLastError(), "sample_graph_s1_kernel launch", error_message))
+  {
+    return false;
+  }
+
+  if(!check_cuda(cudaMemcpy(out_upper_triangle_edges.data(),
+                            impl_->d_upper_triangle_edges,
+                            pair_count * sizeof(unsigned char),
+                            cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(sample_graph_s1)", error_message))
+  {
+    return false;
+  }
+  return true;
+}
+
+bool LikelihoodBackend::sample_graph_sd(int dim,
+                                        double radius,
+                                        double mu,
+                                        double beta,
+                                        unsigned long long seed,
+                                        std::vector<unsigned char> &out_upper_triangle_edges,
+                                        std::string *error_message)
+{
+  if(!is_initialized())
+  {
+    if(error_message)
+    {
+      *error_message = "CUDA backend is not initialized.";
+    }
+    return false;
+  }
+  if(dim <= 0)
+  {
+    if(error_message)
+    {
+      *error_message = "Invalid dimension in sample_graph_sd.";
+    }
+    return false;
+  }
+  if(!impl_->has_kappa || !impl_->has_positions)
+  {
+    if(error_message)
+    {
+      *error_message = "Kappa/positions buffers are not initialized on device.";
+    }
+    return false;
+  }
+  if(impl_->dim_plus_one != dim + 1)
+  {
+    if(error_message)
+    {
+      *error_message = "Device positions dimension mismatch.";
+    }
+    return false;
+  }
+
+  const size_t pair_count =
+    (static_cast<size_t>(impl_->nb_vertices) * static_cast<size_t>(impl_->nb_vertices - 1)) / 2u;
+  out_upper_triangle_edges.resize(pair_count);
+  if(pair_count == 0)
+  {
+    return true;
+  }
+
+  if(pair_count > impl_->upper_triangle_capacity)
+  {
+    if(impl_->d_upper_triangle_edges)
+    {
+      cudaFree(impl_->d_upper_triangle_edges);
+      impl_->d_upper_triangle_edges = nullptr;
+    }
+    if(!check_cuda(cudaMalloc(reinterpret_cast<void **>(&impl_->d_upper_triangle_edges),
+                              pair_count * sizeof(unsigned char)),
+                   "cudaMalloc(d_upper_triangle_edges sd)", error_message))
+    {
+      return false;
+    }
+    impl_->upper_triangle_capacity = pair_count;
+  }
+
+  constexpr int BLOCK_SIZE = 256;
+  int blocks = static_cast<int>((pair_count + static_cast<size_t>(BLOCK_SIZE) - 1) / static_cast<size_t>(BLOCK_SIZE));
+  if(blocks > 65535)
+  {
+    blocks = 65535;
+  }
+
+  sample_graph_sd_kernel<BLOCK_SIZE><<<blocks, BLOCK_SIZE>>>(impl_->d_positions,
+                                                              impl_->dim_plus_one,
+                                                              impl_->d_kappa,
+                                                              impl_->nb_vertices,
+                                                              radius,
+                                                              mu,
+                                                              beta,
+                                                              1.0 / dim,
+                                                              seed,
+                                                              impl_->d_upper_triangle_edges);
+  if(!check_cuda(cudaGetLastError(), "sample_graph_sd_kernel launch", error_message))
+  {
+    return false;
+  }
+
+  if(!check_cuda(cudaMemcpy(out_upper_triangle_edges.data(),
+                            impl_->d_upper_triangle_edges,
+                            pair_count * sizeof(unsigned char),
+                            cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(sample_graph_sd)", error_message))
+  {
+    return false;
+  }
+  return true;
+}
+
+bool LikelihoodBackend::histogram_pconn_s1(double prefactor,
+                                           double beta,
+                                           const std::vector<double> &bin_upper_bounds,
+                                           std::vector<double> &out_n,
+                                           std::vector<double> &out_p,
+                                           std::vector<double> &out_x,
+                                           std::string *error_message)
+{
+  if(!is_initialized())
+  {
+    if(error_message)
+    {
+      *error_message = "CUDA backend is not initialized.";
+    }
+    return false;
+  }
+  if(!impl_->has_kappa || !impl_->has_theta)
+  {
+    if(error_message)
+    {
+      *error_message = "Kappa/theta buffers are not initialized on device.";
+    }
+    return false;
+  }
+  if(bin_upper_bounds.empty())
+  {
+    if(error_message)
+    {
+      *error_message = "Histogram bin upper bounds are empty.";
+    }
+    return false;
+  }
+
+  const int nb_bins = static_cast<int>(bin_upper_bounds.size());
+  if(nb_bins > impl_->histogram_capacity)
+  {
+    if(impl_->d_hist_n)
+    {
+      cudaFree(impl_->d_hist_n);
+      impl_->d_hist_n = nullptr;
+    }
+    if(impl_->d_hist_p)
+    {
+      cudaFree(impl_->d_hist_p);
+      impl_->d_hist_p = nullptr;
+    }
+    if(impl_->d_hist_x)
+    {
+      cudaFree(impl_->d_hist_x);
+      impl_->d_hist_x = nullptr;
+    }
+    if(impl_->d_hist_bins)
+    {
+      cudaFree(impl_->d_hist_bins);
+      impl_->d_hist_bins = nullptr;
+    }
+    if(!check_cuda(cudaMalloc(reinterpret_cast<void **>(&impl_->d_hist_n),
+                              static_cast<size_t>(nb_bins) * sizeof(double)),
+                   "cudaMalloc(d_hist_n)", error_message))
+    {
+      return false;
+    }
+    if(!check_cuda(cudaMalloc(reinterpret_cast<void **>(&impl_->d_hist_p),
+                              static_cast<size_t>(nb_bins) * sizeof(double)),
+                   "cudaMalloc(d_hist_p)", error_message))
+    {
+      return false;
+    }
+    if(!check_cuda(cudaMalloc(reinterpret_cast<void **>(&impl_->d_hist_x),
+                              static_cast<size_t>(nb_bins) * sizeof(double)),
+                   "cudaMalloc(d_hist_x)", error_message))
+    {
+      return false;
+    }
+    if(!check_cuda(cudaMalloc(reinterpret_cast<void **>(&impl_->d_hist_bins),
+                              static_cast<size_t>(nb_bins) * sizeof(double)),
+                   "cudaMalloc(d_hist_bins)", error_message))
+    {
+      return false;
+    }
+    impl_->histogram_capacity = nb_bins;
+  }
+
+  if(!check_cuda(cudaMemcpy(impl_->d_hist_bins,
+                            bin_upper_bounds.data(),
+                            static_cast<size_t>(nb_bins) * sizeof(double),
+                            cudaMemcpyHostToDevice),
+                 "cudaMemcpy(d_hist_bins)", error_message))
+  {
+    return false;
+  }
+  if(!check_cuda(cudaMemset(impl_->d_hist_n, 0, static_cast<size_t>(nb_bins) * sizeof(double)),
+                 "cudaMemset(d_hist_n)", error_message))
+  {
+    return false;
+  }
+  if(!check_cuda(cudaMemset(impl_->d_hist_p, 0, static_cast<size_t>(nb_bins) * sizeof(double)),
+                 "cudaMemset(d_hist_p)", error_message))
+  {
+    return false;
+  }
+  if(!check_cuda(cudaMemset(impl_->d_hist_x, 0, static_cast<size_t>(nb_bins) * sizeof(double)),
+                 "cudaMemset(d_hist_x)", error_message))
+  {
+    return false;
+  }
+
+  const size_t pair_count =
+    (static_cast<size_t>(impl_->nb_vertices) * static_cast<size_t>(impl_->nb_vertices - 1)) / 2u;
+  constexpr int BLOCK_SIZE = 256;
+  int blocks = static_cast<int>((pair_count + static_cast<size_t>(BLOCK_SIZE) - 1) / static_cast<size_t>(BLOCK_SIZE));
+  if(blocks > 65535)
+  {
+    blocks = 65535;
+  }
+
+  histogram_pconn_s1_kernel<BLOCK_SIZE><<<blocks, BLOCK_SIZE>>>(impl_->d_theta,
+                                                                 impl_->d_kappa,
+                                                                 impl_->nb_vertices,
+                                                                 impl_->d_row_offsets,
+                                                                 impl_->d_col_indices,
+                                                                 impl_->d_hist_bins,
+                                                                 nb_bins,
+                                                                 prefactor,
+                                                                 beta,
+                                                                 impl_->d_hist_n,
+                                                                 impl_->d_hist_p,
+                                                                 impl_->d_hist_x);
+  if(!check_cuda(cudaGetLastError(), "histogram_pconn_s1_kernel launch", error_message))
+  {
+    return false;
+  }
+
+  out_n.resize(nb_bins);
+  out_p.resize(nb_bins);
+  out_x.resize(nb_bins);
+  if(!check_cuda(cudaMemcpy(out_n.data(),
+                            impl_->d_hist_n,
+                            static_cast<size_t>(nb_bins) * sizeof(double),
+                            cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(hist_n s1)", error_message))
+  {
+    return false;
+  }
+  if(!check_cuda(cudaMemcpy(out_p.data(),
+                            impl_->d_hist_p,
+                            static_cast<size_t>(nb_bins) * sizeof(double),
+                            cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(hist_p s1)", error_message))
+  {
+    return false;
+  }
+  if(!check_cuda(cudaMemcpy(out_x.data(),
+                            impl_->d_hist_x,
+                            static_cast<size_t>(nb_bins) * sizeof(double),
+                            cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(hist_x s1)", error_message))
+  {
+    return false;
+  }
+  return true;
+}
+
+bool LikelihoodBackend::histogram_pconn_sd(int dim,
+                                           double radius,
+                                           double mu,
+                                           double beta,
+                                           const std::vector<double> &bin_upper_bounds,
+                                           std::vector<double> &out_n,
+                                           std::vector<double> &out_p,
+                                           std::vector<double> &out_x,
+                                           std::string *error_message)
+{
+  if(!is_initialized())
+  {
+    if(error_message)
+    {
+      *error_message = "CUDA backend is not initialized.";
+    }
+    return false;
+  }
+  if(dim <= 0)
+  {
+    if(error_message)
+    {
+      *error_message = "Invalid dimension in histogram_pconn_sd.";
+    }
+    return false;
+  }
+  if(!impl_->has_kappa || !impl_->has_positions)
+  {
+    if(error_message)
+    {
+      *error_message = "Kappa/positions buffers are not initialized on device.";
+    }
+    return false;
+  }
+  if(impl_->dim_plus_one != dim + 1)
+  {
+    if(error_message)
+    {
+      *error_message = "Device positions dimension mismatch.";
+    }
+    return false;
+  }
+  if(bin_upper_bounds.empty())
+  {
+    if(error_message)
+    {
+      *error_message = "Histogram bin upper bounds are empty.";
+    }
+    return false;
+  }
+
+  const int nb_bins = static_cast<int>(bin_upper_bounds.size());
+  if(nb_bins > impl_->histogram_capacity)
+  {
+    if(impl_->d_hist_n)
+    {
+      cudaFree(impl_->d_hist_n);
+      impl_->d_hist_n = nullptr;
+    }
+    if(impl_->d_hist_p)
+    {
+      cudaFree(impl_->d_hist_p);
+      impl_->d_hist_p = nullptr;
+    }
+    if(impl_->d_hist_x)
+    {
+      cudaFree(impl_->d_hist_x);
+      impl_->d_hist_x = nullptr;
+    }
+    if(impl_->d_hist_bins)
+    {
+      cudaFree(impl_->d_hist_bins);
+      impl_->d_hist_bins = nullptr;
+    }
+    if(!check_cuda(cudaMalloc(reinterpret_cast<void **>(&impl_->d_hist_n),
+                              static_cast<size_t>(nb_bins) * sizeof(double)),
+                   "cudaMalloc(d_hist_n sd)", error_message))
+    {
+      return false;
+    }
+    if(!check_cuda(cudaMalloc(reinterpret_cast<void **>(&impl_->d_hist_p),
+                              static_cast<size_t>(nb_bins) * sizeof(double)),
+                   "cudaMalloc(d_hist_p sd)", error_message))
+    {
+      return false;
+    }
+    if(!check_cuda(cudaMalloc(reinterpret_cast<void **>(&impl_->d_hist_x),
+                              static_cast<size_t>(nb_bins) * sizeof(double)),
+                   "cudaMalloc(d_hist_x sd)", error_message))
+    {
+      return false;
+    }
+    if(!check_cuda(cudaMalloc(reinterpret_cast<void **>(&impl_->d_hist_bins),
+                              static_cast<size_t>(nb_bins) * sizeof(double)),
+                   "cudaMalloc(d_hist_bins sd)", error_message))
+    {
+      return false;
+    }
+    impl_->histogram_capacity = nb_bins;
+  }
+
+  if(!check_cuda(cudaMemcpy(impl_->d_hist_bins,
+                            bin_upper_bounds.data(),
+                            static_cast<size_t>(nb_bins) * sizeof(double),
+                            cudaMemcpyHostToDevice),
+                 "cudaMemcpy(d_hist_bins sd)", error_message))
+  {
+    return false;
+  }
+  if(!check_cuda(cudaMemset(impl_->d_hist_n, 0, static_cast<size_t>(nb_bins) * sizeof(double)),
+                 "cudaMemset(d_hist_n sd)", error_message))
+  {
+    return false;
+  }
+  if(!check_cuda(cudaMemset(impl_->d_hist_p, 0, static_cast<size_t>(nb_bins) * sizeof(double)),
+                 "cudaMemset(d_hist_p sd)", error_message))
+  {
+    return false;
+  }
+  if(!check_cuda(cudaMemset(impl_->d_hist_x, 0, static_cast<size_t>(nb_bins) * sizeof(double)),
+                 "cudaMemset(d_hist_x sd)", error_message))
+  {
+    return false;
+  }
+
+  const size_t pair_count =
+    (static_cast<size_t>(impl_->nb_vertices) * static_cast<size_t>(impl_->nb_vertices - 1)) / 2u;
+  constexpr int BLOCK_SIZE = 256;
+  int blocks = static_cast<int>((pair_count + static_cast<size_t>(BLOCK_SIZE) - 1) / static_cast<size_t>(BLOCK_SIZE));
+  if(blocks > 65535)
+  {
+    blocks = 65535;
+  }
+
+  histogram_pconn_sd_kernel<BLOCK_SIZE><<<blocks, BLOCK_SIZE>>>(impl_->d_positions,
+                                                                 impl_->dim_plus_one,
+                                                                 impl_->d_kappa,
+                                                                 impl_->nb_vertices,
+                                                                 impl_->d_row_offsets,
+                                                                 impl_->d_col_indices,
+                                                                 impl_->d_hist_bins,
+                                                                 nb_bins,
+                                                                 radius,
+                                                                 mu,
+                                                                 beta,
+                                                                 1.0 / dim,
+                                                                 impl_->d_hist_n,
+                                                                 impl_->d_hist_p,
+                                                                 impl_->d_hist_x);
+  if(!check_cuda(cudaGetLastError(), "histogram_pconn_sd_kernel launch", error_message))
+  {
+    return false;
+  }
+
+  out_n.resize(nb_bins);
+  out_p.resize(nb_bins);
+  out_x.resize(nb_bins);
+  if(!check_cuda(cudaMemcpy(out_n.data(),
+                            impl_->d_hist_n,
+                            static_cast<size_t>(nb_bins) * sizeof(double),
+                            cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(hist_n sd)", error_message))
+  {
+    return false;
+  }
+  if(!check_cuda(cudaMemcpy(out_p.data(),
+                            impl_->d_hist_p,
+                            static_cast<size_t>(nb_bins) * sizeof(double),
+                            cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(hist_p sd)", error_message))
+  {
+    return false;
+  }
+  if(!check_cuda(cudaMemcpy(out_x.data(),
+                            impl_->d_hist_x,
+                            static_cast<size_t>(nb_bins) * sizeof(double),
+                            cudaMemcpyDeviceToHost),
+                 "cudaMemcpy(hist_x sd)", error_message))
+  {
+    return false;
   }
   return true;
 }

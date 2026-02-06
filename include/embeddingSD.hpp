@@ -235,6 +235,7 @@ class embeddingSD_t
     bool cuda_available = false;
     bool cuda_s1_refinement_active = false;
     bool cuda_sd_refinement_active = false;
+    unsigned long long cuda_validation_sample_counter = 0ULL;
     std::vector<int> adjacency_row_offsets;
     std::vector<int> adjacency_col_indices;
     std::vector<double> d_positions_soa_cache;
@@ -1869,6 +1870,48 @@ void embeddingSD_t::generate_simulated_adjacency_list(int dim, bool random_posit
   // Initializes the container.
   simulated_adjacency_list.clear();
   simulated_adjacency_list.resize(nb_vertices);
+
+#ifdef DMERCATOR_USE_CUDA
+  if(cuda_available && cuda_backend)
+  {
+    std::vector<unsigned char> upper_triangle_edges;
+    const bool ready = prepare_cuda_refinement_sd(dim);
+    if(ready)
+    {
+      std::string error_message;
+      const unsigned long long sample_seed =
+        (static_cast<unsigned long long>(SEED) ^ 0x94d049bb133111ebULL) + cuda_validation_sample_counter++;
+      if(cuda_backend->sample_graph_sd(dim,
+                                       radius,
+                                       mu,
+                                       beta,
+                                       sample_seed,
+                                       upper_triangle_edges,
+                                       &error_message))
+      {
+        size_t edge_id = 0;
+        for(int v1 = 0; v1 < nb_vertices; ++v1)
+        {
+          for(int v2 = v1 + 1; v2 < nb_vertices; ++v2, ++edge_id)
+          {
+            if(upper_triangle_edges[edge_id] != 0)
+            {
+              simulated_adjacency_list[v1].insert(v2);
+              simulated_adjacency_list[v2].insert(v1);
+            }
+          }
+        }
+        return;
+      }
+      if(!QUIET_MODE)
+      {
+        std::clog << TAB << "WARNING: CUDA validation sampling failed, switching to CPU: "
+                  << error_message << std::endl;
+      }
+    }
+  }
+#endif
+
   // Generates the adjacency list.
   // TODO: for large networks it could be parallelized by splitting vertices into groups
   //  and computing probability inside each of them.
@@ -1893,6 +1936,47 @@ void embeddingSD_t::generate_simulated_adjacency_list()
   // Initializes the container.
   simulated_adjacency_list.clear();
   simulated_adjacency_list.resize(nb_vertices);
+
+#ifdef DMERCATOR_USE_CUDA
+  if(cuda_available && cuda_backend)
+  {
+    std::vector<unsigned char> upper_triangle_edges;
+    const bool ready = prepare_cuda_refinement_s1();
+    if(ready)
+    {
+      std::string error_message;
+      const double prefactor = nb_vertices / (2 * PI * mu);
+      const unsigned long long sample_seed =
+        (static_cast<unsigned long long>(SEED) ^ 0xbf58476d1ce4e5b9ULL) + cuda_validation_sample_counter++;
+      if(cuda_backend->sample_graph_s1(prefactor,
+                                       beta,
+                                       sample_seed,
+                                       upper_triangle_edges,
+                                       &error_message))
+      {
+        size_t edge_id = 0;
+        for(int v1 = 0; v1 < nb_vertices; ++v1)
+        {
+          for(int v2 = v1 + 1; v2 < nb_vertices; ++v2, ++edge_id)
+          {
+            if(upper_triangle_edges[edge_id] != 0)
+            {
+              simulated_adjacency_list[v1].insert(v2);
+              simulated_adjacency_list[v2].insert(v1);
+            }
+          }
+        }
+        return;
+      }
+      if(!QUIET_MODE)
+      {
+        std::clog << TAB << "WARNING: CUDA validation sampling failed, switching to CPU: "
+                  << error_message << std::endl;
+      }
+    }
+  }
+#endif
+
   // Generates the adjacency list.
   double kappa1, theta1, dtheta, prob;
   double prefactor = nb_vertices / (2 * PI * mu);
@@ -3433,6 +3517,7 @@ void embeddingSD_t::initialize_cuda_backend()
   cuda_available = false;
   cuda_s1_refinement_active = false;
   cuda_sd_refinement_active = false;
+  cuda_validation_sample_counter = 0ULL;
 
   const char *disable_cuda = std::getenv("DMERCATOR_DISABLE_CUDA");
   if(disable_cuda && std::string(disable_cuda) == "1")
@@ -3461,7 +3546,7 @@ void embeddingSD_t::initialize_cuda_backend()
   cuda_available = true;
   if(!QUIET_MODE)
   {
-    std::clog << TAB << "CUDA backend: enabled for refinement, kappa, and beta inference." << std::endl;
+    std::clog << TAB << "CUDA backend: enabled for refinement, kappa/beta inference, and validation." << std::endl;
   }
 }
 
@@ -4069,25 +4154,67 @@ void embeddingSD_t::save_inferred_connection_probability(int dim)
   std::vector<double> n(bins.size(), 0);
   std::vector<double> p(bins.size(), 0);
   std::vector<double> x(bins.size(), 0);
-  // Computes the connection probability for every pair of vertices.
-  double k1;
-  double t1;
-  double da;
-  double dist;
-  for(int v1(0), i; v1<nb_vertices; ++v1)
+  bool computed_on_gpu = false;
+#ifdef DMERCATOR_USE_CUDA
+  if(cuda_available && cuda_backend)
   {
-    k1 = kappa[v1];
-    const auto pos1 = d_positions[v1];
-    for(int v2(v1 + 1); v2<nb_vertices; ++v2)
+    std::vector<double> bin_upper_bounds(bins.size(), 0);
+    for(const auto &entry : bins)
     {
-      da = compute_angle_d_vectors(pos1, d_positions[v2]);
-      dist = (radius * da) / std::pow(mu * k1 * kappa[v2], 1.0 / dim);
-      i = bins.lower_bound(dist)->second;
-      n[i] += 1;
-      x[i] += dist;
-      if(adjacency_list[v1].find(v2) != adjacency_list[v1].end())
+      bin_upper_bounds[entry.second] = entry.first;
+    }
+
+    const bool ready = prepare_cuda_refinement_sd(dim);
+    if(ready)
+    {
+      std::vector<double> hist_n;
+      std::vector<double> hist_p;
+      std::vector<double> hist_x;
+      std::string error_message;
+      if(cuda_backend->histogram_pconn_sd(dim,
+                                          radius,
+                                          mu,
+                                          beta,
+                                          bin_upper_bounds,
+                                          hist_n,
+                                          hist_p,
+                                          hist_x,
+                                          &error_message))
       {
-        p[i] += 1;
+        n.swap(hist_n);
+        p.swap(hist_p);
+        x.swap(hist_x);
+        computed_on_gpu = true;
+      }
+      else if(!QUIET_MODE)
+      {
+        std::clog << TAB << "WARNING: CUDA validation histogram failed, switching to CPU: "
+                  << error_message << std::endl;
+      }
+    }
+  }
+#endif
+  // Computes the connection probability for every pair of vertices.
+  if(!computed_on_gpu)
+  {
+    double k1;
+    double da;
+    double dist;
+    for(int v1(0), i; v1<nb_vertices; ++v1)
+    {
+      k1 = kappa[v1];
+      const auto pos1 = d_positions[v1];
+      for(int v2(v1 + 1); v2<nb_vertices; ++v2)
+      {
+        da = compute_angle_d_vectors(pos1, d_positions[v2]);
+        dist = (radius * da) / std::pow(mu * k1 * kappa[v2], 1.0 / dim);
+        i = bins.lower_bound(dist)->second;
+        n[i] += 1;
+        x[i] += dist;
+        if(adjacency_list[v1].find(v2) != adjacency_list[v1].end())
+        {
+          p[i] += 1;
+        }
       }
     }
   }
@@ -4138,25 +4265,67 @@ void embeddingSD_t::save_inferred_connection_probability()
   std::vector<double> n(bins.size(), 0);
   std::vector<double> p(bins.size(), 0);
   std::vector<double> x(bins.size(), 0);
-  // Computes the connection probability for every pair of vertices.
-  double k1;
-  double t1;
-  double da;
-  double dist;
-  for(int v1(0), i; v1<nb_vertices; ++v1)
+  bool computed_on_gpu = false;
+#ifdef DMERCATOR_USE_CUDA
+  if(cuda_available && cuda_backend)
   {
-    k1 = kappa[v1];
-    t1 = theta[v1];
-    for(int v2(v1 + 1); v2<nb_vertices; ++v2)
+    std::vector<double> bin_upper_bounds(bins.size(), 0);
+    for(const auto &entry : bins)
     {
-      da = PI - std::fabs( PI - std::fabs(t1 - theta[v2]) );
-      dist = (nb_vertices * da) / (2 * PI * mu * k1 * kappa[v2]);
-      i = bins.lower_bound(dist)->second;
-      n[i] += 1;
-      x[i] += dist;
-      if(adjacency_list[v1].find(v2) != adjacency_list[v1].end())
+      bin_upper_bounds[entry.second] = entry.first;
+    }
+
+    const bool ready = prepare_cuda_refinement_s1();
+    if(ready)
+    {
+      const double prefactor = nb_vertices / (2 * PI * mu);
+      std::vector<double> hist_n;
+      std::vector<double> hist_p;
+      std::vector<double> hist_x;
+      std::string error_message;
+      if(cuda_backend->histogram_pconn_s1(prefactor,
+                                          beta,
+                                          bin_upper_bounds,
+                                          hist_n,
+                                          hist_p,
+                                          hist_x,
+                                          &error_message))
       {
-        p[i] += 1;
+        n.swap(hist_n);
+        p.swap(hist_p);
+        x.swap(hist_x);
+        computed_on_gpu = true;
+      }
+      else if(!QUIET_MODE)
+      {
+        std::clog << TAB << "WARNING: CUDA validation histogram failed, switching to CPU: "
+                  << error_message << std::endl;
+      }
+    }
+  }
+#endif
+  // Computes the connection probability for every pair of vertices.
+  if(!computed_on_gpu)
+  {
+    double k1;
+    double t1;
+    double da;
+    double dist;
+    for(int v1(0), i; v1<nb_vertices; ++v1)
+    {
+      k1 = kappa[v1];
+      t1 = theta[v1];
+      for(int v2(v1 + 1); v2<nb_vertices; ++v2)
+      {
+        da = PI - std::fabs( PI - std::fabs(t1 - theta[v2]) );
+        dist = (nb_vertices * da) / (2 * PI * mu * k1 * kappa[v2]);
+        i = bins.lower_bound(dist)->second;
+        n[i] += 1;
+        x[i] += dist;
+        if(adjacency_list[v1].find(v2) != adjacency_list[v1].end())
+        {
+          p[i] += 1;
+        }
       }
     }
   }

@@ -102,6 +102,42 @@ class LikelihoodBackend
                                      double *out_mean_clustering,
                                      std::string *error_message);
 
+    // Samples one synthetic graph in S^1 and returns upper-triangular edge flags (i<j).
+    bool sample_graph_s1(double prefactor,
+                         double beta,
+                         unsigned long long seed,
+                         std::vector<unsigned char> &out_upper_triangle_edges,
+                         std::string *error_message);
+
+    // Samples one synthetic graph in S^D and returns upper-triangular edge flags (i<j).
+    bool sample_graph_sd(int dim,
+                         double radius,
+                         double mu,
+                         double beta,
+                         unsigned long long seed,
+                         std::vector<unsigned char> &out_upper_triangle_edges,
+                         std::string *error_message);
+
+    // Computes histogram accumulators used by *.inf_pconn in S^1.
+    bool histogram_pconn_s1(double prefactor,
+                            double beta,
+                            const std::vector<double> &bin_upper_bounds,
+                            std::vector<double> &out_n,
+                            std::vector<double> &out_p,
+                            std::vector<double> &out_x,
+                            std::string *error_message);
+
+    // Computes histogram accumulators used by *.inf_pconn in S^D.
+    bool histogram_pconn_sd(int dim,
+                            double radius,
+                            double mu,
+                            double beta,
+                            const std::vector<double> &bin_upper_bounds,
+                            std::vector<double> &out_n,
+                            std::vector<double> &out_p,
+                            std::vector<double> &out_x,
+                            std::string *error_message);
+
   private:
     struct Impl;
     Impl *impl_;
