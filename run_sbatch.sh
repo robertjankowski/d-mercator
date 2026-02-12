@@ -21,4 +21,4 @@ cmake -S . -B build-cuda -G "Unix Makefiles" -DCMAKE_BUILD_TYPE=Release -DDMERCA
 cmake --build build-cuda -j 8
 
 # Run embeddings
-srun ./build-cuda/mercator -d 1 /n/holylabs/LABS/mweber_lab/Everyone/rjankowski/repo/d-mercator/data/internet.edge
+srun ./build-cuda/mercator -d 1 -v /n/holylabs/LABS/mweber_lab/Everyone/rjankowski/repo/d-mercator/data/internet.edge
