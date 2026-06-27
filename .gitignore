@@ -41,6 +41,7 @@ benchmark_runs
 build_cpu/
 build_cuda/
 build-cuda/
+build_tools/
 test_gpu_*
 *.err
 *.out
